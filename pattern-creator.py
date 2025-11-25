@@ -8,6 +8,7 @@ from reportlab.lib import colors
 from PIL import Image, ImageDraw, ImageTk
 
 def draw_circle_background(c, diameter_mm):
+    print("Drawing circle background...")
     radius_pt = (diameter_mm / 2.0) * mm
     page_size = diameter_mm * mm + 4 * mm
     cx = cy = page_size / 2.0
