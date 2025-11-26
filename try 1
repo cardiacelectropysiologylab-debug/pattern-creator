@@ -180,70 +180,234 @@ def add_diffuse_preview(draw, cx, cy, radius_px, coverage, spot_size_px, spacing
 
 # ========== PATCHY PATTERN ==========
 def add_patchy(c, cx, cy, radius_pt, coverage, patch_size_mm, dispersion):
-    """Add larger irregular patches (patchy fibrosis)"""
+    """Add scattered short stripe segments (patchy fibrosis) causing zig-zag conduction
+    
+    Creates rectangular stripe segments scattered throughout:
+    - Short rectangles at various angles
+    - Staggered/offset positions
+    - Variable sizes creating irregular pattern
+    """
     if coverage <= 0:
         return
-    patch_radius_pt = (patch_size_mm / 2.0) * mm
+    
+    # Base rectangle dimensions
+    base_length_pt = patch_size_mm * mm
+    base_width_pt = patch_size_mm * mm * 0.3  # Rectangles are ~3:1 ratio
+    
     area_total = math.pi * radius_pt ** 2
-    area_single_patch = math.pi * patch_radius_pt ** 2
-    n_patches = int((coverage * area_total) / area_single_patch)
+    area_single_rect = base_length_pt * base_width_pt
+    
+    # Calculate number of rectangles needed for coverage
+    n_rectangles = int((coverage * area_total) / area_single_rect)
+    
     c.setFillColor(colors.black)
-    for _ in range(n_patches):
+    
+    for _ in range(n_rectangles):
+        # Random position within circle
         angle = random.uniform(0, 2 * math.pi)
         r_factor = random.uniform(0, 1) ** (1.0 / dispersion)
         r = radius_pt * r_factor
-        x = cx + r * math.cos(angle)
-        y = cy + r * math.sin(angle)
-        irregularity = random.uniform(0.8, 1.2)
-        c.ellipse(x - patch_radius_pt * irregularity, y - patch_radius_pt,
-                 x + patch_radius_pt * irregularity, y + patch_radius_pt,
-                 stroke=0, fill=1)
+        px = cx + r * math.cos(angle)
+        py = cy + r * math.sin(angle)
+        
+        # Variable size (some larger, some smaller)
+        size_factor = random.uniform(0.5, 1.5)
+        rect_length = base_length_pt * size_factor
+        rect_width = base_width_pt * size_factor
+        
+        # Random rotation for each rectangle
+        rotation_angle = random.uniform(0, 180)  # degrees
+        
+        # Create rectangle centered at origin
+        half_length = rect_length / 2.0
+        half_width = rect_width / 2.0
+        
+        # Four corners of rectangle
+        corners = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width)
+        ]
+        
+        # Rotate and translate corners
+        angle_rad = math.radians(rotation_angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        points = []
+        for x, y in corners:
+            # Rotate
+            x_rot = x * cos_a - y * sin_a
+            y_rot = x * sin_a + y * cos_a
+            # Translate to position
+            points.append((px + x_rot, py + y_rot))
+        
+        # Draw filled rectangle
+        p = c.beginPath()
+        p.moveTo(points[0][0], points[0][1])
+        for x, y in points[1:]:
+            p.lineTo(x, y)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
 
 def add_patchy_preview(draw, cx, cy, radius_px, coverage, patch_size_px, dispersion):
     """Preview for patchy pattern"""
     if coverage <= 0:
         return
-    patch_radius_px = max(2.0, patch_size_px / 2.0)
+    
+    # Base rectangle dimensions
+    base_length_px = patch_size_px
+    base_width_px = patch_size_px * 0.3
+    
     area_total = math.pi * radius_px ** 2
-    area_single_patch = math.pi * patch_radius_px ** 2
-    n_patches = int((coverage * area_total) / area_single_patch)
-    for _ in range(n_patches):
+    area_single_rect = base_length_px * base_width_px
+    
+    # Calculate number of rectangles
+    n_rectangles = int((coverage * area_total) / area_single_rect)
+    
+    for _ in range(n_rectangles):
+        # Random position
         angle = random.uniform(0, 2 * math.pi)
         r_factor = random.uniform(0, 1) ** (1.0 / dispersion)
         r = radius_px * r_factor
-        x = cx + r * math.cos(angle)
-        y = cy + r * math.sin(angle)
-        irregularity = random.uniform(0.8, 1.2)
-        draw.ellipse((x - patch_radius_px * irregularity, y - patch_radius_px,
-                     x + patch_radius_px * irregularity, y + patch_radius_px), fill=0)
+        px = cx + r * math.cos(angle)
+        py = cy + r * math.sin(angle)
+        
+        # Variable size
+        size_factor = random.uniform(0.5, 1.5)
+        rect_length = base_length_px * size_factor
+        rect_width = base_width_px * size_factor
+        
+        # Random rotation
+        rotation_angle = random.uniform(0, 180)
+        
+        # Create rectangle
+        half_length = rect_length / 2.0
+        half_width = rect_width / 2.0
+        
+        corners = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width)
+        ]
+        
+        # Rotate and translate
+        angle_rad = math.radians(rotation_angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        
+        points = []
+        for x, y in corners:
+            x_rot = x * cos_a - y * sin_a
+            y_rot = x * sin_a + y * cos_a
+            points.append((px + x_rot, py + y_rot))
+        
+        # Draw filled rectangle
+        draw.polygon(points, fill=0, outline=0)
 
 # ========== COMPACT PATTERN ==========
-def add_compact(c, cx, cy, radius_pt, coverage, border_width_mm):
-    """Add solid central region (compact fibrosis)"""
+def add_compact(c, cx, cy, radius_pt, coverage, border_width_mm, irregularity, offset_x_mm, offset_y_mm):
+    """Add solid central region with irregular shape (compact fibrosis)"""
     if coverage <= 0:
         return
+    
+    # Calculate base radius for coverage
     scar_radius_pt = radius_pt * math.sqrt(coverage)
+    
+    # Apply offset
+    offset_x_pt = offset_x_mm * mm
+    offset_y_pt = offset_y_mm * mm
+    scar_cx = cx + offset_x_pt
+    scar_cy = cy + offset_y_pt
+    
     c.setFillColor(colors.black)
-    c.circle(cx, cy, scar_radius_pt, stroke=0, fill=1)
-    if border_width_mm > 0:
-        border_pt = border_width_mm * mm
-        c.setFillColor(colors.white)
-        c.setStrokeColor(colors.white)
-        c.setLineWidth(border_pt)
-        c.circle(cx, cy, scar_radius_pt, stroke=1, fill=0)
+    
+    if irregularity <= 0.01:
+        # Perfect circle
+        c.circle(scar_cx, scar_cy, scar_radius_pt, stroke=0, fill=1)
+    else:
+        # Irregular blob using Perlin-noise-like smooth deformation
+        n_points = 64  # More points for smoother shape
+        points = []
+        
+        # Generate smooth random variations using sum of sinusoids
+        num_harmonics = 5
+        amplitudes = [random.uniform(0.5, 1.0) for _ in range(num_harmonics)]
+        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
+        
+        for i in range(n_points):
+            angle = (2 * math.pi * i) / n_points
+            
+            # Sum of sinusoids for smooth variation
+            r_variation = 0
+            for h in range(num_harmonics):
+                freq = h + 1
+                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
+            
+            # Normalize and scale by irregularity
+            r_variation = r_variation / num_harmonics  # Range: -1 to 1
+            r_factor = 1.0 + irregularity * r_variation
+            
+            r = scar_radius_pt * r_factor
+            x = scar_cx + r * math.cos(angle)
+            y = scar_cy + r * math.sin(angle)
+            points.append((x, y))
+        
+        # Draw filled polygon (no gaps)
+        p = c.beginPath()
+        p.moveTo(points[0][0], points[0][1])
+        for x, y in points[1:]:
+            p.lineTo(x, y)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
 
-def add_compact_preview(draw, cx, cy, radius_px, coverage, border_width_px):
+def add_compact_preview(draw, cx, cy, radius_px, coverage, border_width_px, irregularity, offset_x_px, offset_y_px):
     """Preview for compact pattern"""
     if coverage <= 0:
         return
+    
     scar_radius_px = radius_px * math.sqrt(coverage)
-    draw.ellipse((cx - scar_radius_px, cy - scar_radius_px,
-                 cx + scar_radius_px, cy + scar_radius_px), fill=0)
-    if border_width_px > 0:
-        border_px = max(1, int(border_width_px))
-        draw.ellipse((cx - scar_radius_px, cy - scar_radius_px,
-                     cx + scar_radius_px, cy + scar_radius_px),
-                    outline=255, width=border_px)
+    
+    # Apply offset
+    scar_cx = cx + offset_x_px
+    scar_cy = cy + offset_y_px
+    
+    if irregularity <= 0.01:
+        # Perfect circle
+        draw.ellipse((scar_cx - scar_radius_px, scar_cy - scar_radius_px,
+                     scar_cx + scar_radius_px, scar_cy + scar_radius_px), fill=0)
+    else:
+        # Irregular blob using smooth deformation
+        n_points = 64  # More points for smoother shape
+        points = []
+        
+        # Generate smooth random variations using sum of sinusoids
+        num_harmonics = 5
+        amplitudes = [random.uniform(0.5, 1.0) for _ in range(num_harmonics)]
+        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
+        
+        for i in range(n_points):
+            angle = (2 * math.pi * i) / n_points
+            
+            # Sum of sinusoids for smooth variation
+            r_variation = 0
+            for h in range(num_harmonics):
+                freq = h + 1
+                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
+            
+            # Normalize and scale by irregularity
+            r_variation = r_variation / num_harmonics  # Range: -1 to 1
+            r_factor = 1.0 + irregularity * r_variation
+            
+            r = scar_radius_px * r_factor
+            x = scar_cx + r * math.cos(angle)
+            y = scar_cy + r * math.sin(angle)
+            points.append((x, y))
+        
+        # Draw filled polygon (completely solid, no gaps)
+        draw.polygon(points, fill=0, outline=0)
 
 # ========== MAIN GENERATION FUNCTIONS ==========
 def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15, **kwargs):
@@ -288,10 +452,16 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
     
     elif pattern_type == "Compact":
         border_width_mm = kwargs.get("border_width_mm", 0.1)
+        irregularity = kwargs.get("irregularity", 0.0)
+        offset_x_mm = kwargs.get("offset_x_mm", 0.0)
+        offset_y_mm = kwargs.get("offset_y_mm", 0.0)
         border_width_px = (border_width_mm / circle_diameter_mm) * (2 * pattern_radius_px)
-        add_compact_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage, border_width_px)
+        offset_x_px = (offset_x_mm / circle_diameter_mm) * (2 * pattern_radius_px)
+        offset_y_px = (offset_y_mm / circle_diameter_mm) * (2 * pattern_radius_px)
+        add_compact_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage, border_width_px, 
+                           irregularity, offset_x_px, offset_y_px)
     
-    # Mask to pattern region only
+    # Mask to pattern region
     mask = Image.new("L", (size_px, size_px), 0)
     draw_m = ImageDraw.Draw(mask)
     draw_m.ellipse((cx - pattern_radius_px, cy - pattern_radius_px, 
@@ -341,7 +511,11 @@ def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white
     
     elif pattern_type == "Compact":
         border_width_mm = kwargs.get("border_width_mm", 0.1)
-        add_compact(c, cx, cy, pattern_radius_pt, inner_coverage, border_width_mm)
+        irregularity = kwargs.get("irregularity", 0.0)
+        offset_x_mm = kwargs.get("offset_x_mm", 0.0)
+        offset_y_mm = kwargs.get("offset_y_mm", 0.0)
+        add_compact(c, cx, cy, pattern_radius_pt, inner_coverage, border_width_mm, 
+                   irregularity, offset_x_mm, offset_y_mm)
     
     c.restoreState()
     end_clip(c)
@@ -383,6 +557,9 @@ class FibrosisPatternGUI:
         
         # Compact
         self.var_border_width = tk.DoubleVar(value=100.0)
+        self.var_irregularity = tk.DoubleVar(value=0.2)  # 0 = circle, higher = more irregular
+        self.var_offset_x = tk.DoubleVar(value=0.0)  # Horizontal offset in mm
+        self.var_offset_y = tk.DoubleVar(value=0.0)  # Vertical offset in mm
 
         main = ttk.Frame(self.root, padding=10)
         main.grid(row=0, column=0, sticky="nsew")
@@ -570,10 +747,19 @@ class FibrosisPatternGUI:
         
         elif pattern_type == "Patchy":
             self._add_entry(self.params_frame, 0, "Patch size (µm):", self.var_patch_size, "µm")
-            self._add_entry(self.params_frame, 1, "Dispersion:", self.var_dispersion, "")
+            ttk.Label(self.params_frame, text="(creates mix of large and small patches)", 
+                     font=("TkDefaultFont", 8, "italic")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 2))
+            self._add_slider(self.params_frame, 2, "Dispersion:", self.var_dispersion, 0.3, 3.0, "")
+            ttk.Label(self.params_frame, text="(lower=clustered, higher=spread out)", 
+                     font=("TkDefaultFont", 8, "italic")).grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 2))
         
         elif pattern_type == "Compact":
-            self._add_entry(self.params_frame, 0, "Border width (µm):", self.var_border_width, "µm")
+            self._add_slider(self.params_frame, 0, "Irregularity:", self.var_irregularity, 0.0, 0.5, "")
+            ttk.Label(self.params_frame, text="(0=circle, higher=more irregular)", 
+                     font=("TkDefaultFont", 8, "italic")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 2))
+            self._add_slider(self.params_frame, 2, "Offset X (mm):", self.var_offset_x, -3.0, 3.0, "mm")
+            self._add_slider(self.params_frame, 3, "Offset Y (mm):", self.var_offset_y, -3.0, 3.0, "mm")
+            self._add_entry(self.params_frame, 4, "Border width (µm):", self.var_border_width, "µm")
     
     def _add_entry(self, parent, row, label, var, unit):
         """Add a labeled entry field"""
@@ -629,6 +815,9 @@ class FibrosisPatternGUI:
             params["dispersion"] = self.var_dispersion.get()
         elif pattern_type == "Compact":
             params["border_width_mm"] = self.var_border_width.get() / 1000.0
+            params["irregularity"] = self.var_irregularity.get()
+            params["offset_x_mm"] = self.var_offset_x.get()
+            params["offset_y_mm"] = self.var_offset_y.get()
         
         return params
 
