@@ -185,9 +185,9 @@ def add_patchy(c, cx, cy, radius_pt, coverage, island_size_mm, num_islands, dens
     
     # Generate islands
     for _ in range(int(num_islands)):
-        # Random position within circle (weighted toward center by density)
+        # Random position uniformly distributed throughout circle area
         angle = random.uniform(0, 2 * math.pi)
-        r_factor = random.uniform(0, 1) ** (1.0 / max(0.1, density))
+        r_factor = random.uniform(0, 1) ** 0.5  # Square root for uniform area distribution
         r = radius_pt * r_factor
         island_cx = cx + r * math.cos(angle)
         island_cy = cy + r * math.sin(angle)
@@ -244,9 +244,9 @@ def add_patchy_preview(draw, cx, cy, radius_px, coverage, island_size_px, num_is
     
     # Generate islands
     for _ in range(int(num_islands)):
-        # Random position within circle
+        # Random position uniformly distributed throughout circle area
         angle = random.uniform(0, 2 * math.pi)
-        r_factor = random.uniform(0, 1) ** (1.0 / max(0.1, density))
+        r_factor = random.uniform(0, 1) ** 0.5  # Square root for uniform area distribution
         r = radius_px * r_factor
         island_cx = cx + r * math.cos(angle)
         island_cy = cy + r * math.sin(angle)
@@ -657,7 +657,7 @@ class PatternCreatorApp:
                             callback=self.on_preview)
             self._add_slider(self.params_frame, 1, "Island density:", self.var_density, 0.2, 2.0, "",
                             callback=self.on_preview)
-            ttk.Label(self.params_frame, text="  (0.2=center-clustered, 1.0=uniform, 2.0=edge-spread)", 
+            ttk.Label(self.params_frame, text="  (0.2=sparse/large, 1.0=uniform, 2.0=dense/small)", 
                      font=("TkDefaultFont", 8, "italic")).grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 2))
         
         elif pattern_type == "Compact":
