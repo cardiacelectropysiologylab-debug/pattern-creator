@@ -151,9 +151,20 @@ class InterstitialGUI:
     def _build_widgets(self):
         self.var_coverage = tk.DoubleVar(value=20.0)
         self.var_diameter = tk.DoubleVar(value=10.0)
+        self.var_well_size = tk.StringVar(value="35mm dish (10mm well)")
         self.var_border = tk.DoubleVar(value=15.0)
         self.var_stripe_width = tk.DoubleVar(value=20.0)
         self.var_stripe_angle = tk.DoubleVar(value=0.0)
+        
+        # MatTek well size presets
+        self.mattek_sizes = {
+            "35mm dish (10mm well)": 10.0,
+            "35mm dish (9mm well)": 9.0,
+            "12-well plate": 3.7,
+            "96-well plate": 0.8,
+            "Custom": None
+        }
+        
         main = ttk.Frame(self.root, padding=10)
         main.grid(row=0, column=0, sticky="nsew")
         controls = ttk.Frame(main)
@@ -162,6 +173,7 @@ class InterstitialGUI:
         preview_frame.grid(row=0, column=1, sticky="nsew")
         row = 0
         self._add_number_entry(controls, row, "Coverage (% area scar):", self.var_coverage, 0, 60, 1, "%"); row += 1
+        self._add_well_size_selector(controls, row); row += 1
         self._add_number_entry(controls, row, "Circle diameter (mm):", self.var_diameter, 4, 25, 0.1, "mm"); row += 1
         self._add_number_entry(controls, row, "White border (% radius):", self.var_border, 0, 40, 1, "%"); row += 1
         self._add_number_entry(controls, row, "Stripe width (µm):", self.var_stripe_width, 2, 80, 1, "µm"); row += 1
@@ -190,6 +202,26 @@ class InterstitialGUI:
         if unit:
             ttk.Label(frame, text=unit).pack(side="left", padx=(4, 0))
         return frame
+    
+    def _add_well_size_selector(self, parent, row):
+        ttk.Label(parent, text="MatTek well size:").grid(row=row, column=0, sticky="w")
+        combo = ttk.Combobox(
+            parent,
+            textvariable=self.var_well_size,
+            values=list(self.mattek_sizes.keys()),
+            state="readonly",
+            width=20
+        )
+        combo.grid(row=row, column=1, sticky="ew", pady=2)
+        combo.bind("<<ComboboxSelected>>", self._on_well_size_change)
+        return combo
+    
+    def _on_well_size_change(self, event=None):
+        selected = self.var_well_size.get()
+        diameter = self.mattek_sizes.get(selected)
+        if diameter is not None:
+            self.var_diameter.set(diameter)
+    
     def _current_params(self):
         return dict(
             coverage=max(0.0, min(1.0, self.var_coverage.get() / 100.0)),
