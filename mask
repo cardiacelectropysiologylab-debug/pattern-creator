@@ -1,0 +1,469 @@
+"""
+Radial Hole Detector for Microscopy Images
+===========================================
+Detects holes in tissue images by comparing each pixel only to tissue pixels
+at a similar radial distance from the tissue center. This handles non-uniform
+tissue intensity (bright center, dim edges) and artifactual hole signals.
+
+Usage:
+    python radial_hole_detector.py
+
+Adjust the parameters in the PARAMETERS section below before running.
+
+Dependencies:
+    pip install numpy scipy scikit-image tifffile matplotlib
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import numpy as np
+import tifffile
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+from scipy import ndimage
+from skimage import filters, morphology, measure, exposure
+
+
+# ============================================================
+# PARAMETERS — Edit these before running
+# ============================================================
+
+# Input file: single 2D TIFF or multi-frame 3D TIFF stack
+INPUT_PATH = r"C:\Users\Lior\Desktop\New folder\02-1hz pacing_short.tif"
+
+# Directory where all output files will be saved
+OUTPUT_DIR = r"C:\Users\Lior\Desktop\New folder\result"
+
+# Ring width in pixels for radial annuli
+# Smaller = finer radial resolution; larger = more stable statistics per ring
+RING_WIDTH = 8  # pixels
+
+# Sensitivity for MAD-based hole detection
+# Lower k = more sensitive (more pixels flagged as holes); higher k = stricter
+# Typical range: 1.5 (sensitive) to 3.0 (strict)
+K_MAD = 1.0
+
+# Percentile-based threshold (alternative to MAD)
+# Pixels below this percentile within a ring are flagged as holes
+# Set USE_PERCENTILE = True to use this instead of MAD
+USE_PERCENTILE = False
+HOLE_PERCENTILE = 25  # e.g. 25 means pixels below the 25th percentile of the ring
+
+# Minimum hole area in pixels — smaller objects are removed as noise
+MIN_HOLE_SIZE = 10  # pixels
+
+# Apply CLAHE contrast enhancement to the reference image for outer mask detection?
+# Useful if the tissue boundary is hard to detect; does not affect intensity values used for thresholding
+USE_CLAHE = False
+
+# Apply a spatial median filter to the reference image before thresholding?
+# Reduces salt-and-pepper noise; radius in pixels
+USE_MEDIAN_FILTER = True
+MEDIAN_FILTER_RADIUS = 3  # pixels
+
+# Morphological closing radius for outer tissue mask cleanup
+CLOSING_RADIUS = 20  # pixels
+
+# Use automatic centroid from the outer tissue mask?
+# Set AUTO_CENTER = False and provide MANUAL_X0, MANUAL_Y0 to override
+AUTO_CENTER = True
+MANUAL_X0 = None  # used only if AUTO_CENTER = False
+MANUAL_Y0 = None  # used only if AUTO_CENTER = False
+
+# Minimum number of frames to treat the input as a stack (else treat as 2D)
+MIN_FRAMES_FOR_STACK = 2
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def load_image(path: str) -> np.ndarray:
+    """
+    Load a TIFF file preserving original bit depth.
+    Returns a 2D array (single frame) or 3D array (stack, shape: [T, Y, X]).
+    """
+    print(f"[load] Loading: {path}")
+    img = tifffile.imread(path)
+    print(f"[load] Shape: {img.shape}, dtype: {img.dtype}, "
+          f"min={img.min()}, max={img.max()}")
+    return img
+
+
+def make_reference(stack: np.ndarray) -> np.ndarray:
+    """
+    Create a stable 2D reference image from a stack using median projection.
+    If the input is already 2D, return it as-is.
+    Preserves original dtype (float32 for computation).
+    """
+    if stack.ndim == 2:
+        print("[reference] Input is 2D — using as reference directly.")
+        return stack.astype(np.float32)
+    elif stack.ndim == 3 and stack.shape[0] >= MIN_FRAMES_FOR_STACK:
+        print(f"[reference] Computing median projection over {stack.shape[0]} frames.")
+        ref = np.median(stack.astype(np.float32), axis=0)
+        return ref
+    else:
+        print("[reference] Single frame or unexpected shape — using first slice.")
+        return stack[0].astype(np.float32)
+
+
+def preprocess_for_masking(ref: np.ndarray) -> np.ndarray:
+    """
+    Optionally apply spatial median filtering and/or CLAHE to the reference
+    image to improve outer mask detection. Returns a processed float32 image
+    normalised to [0, 1] for thresholding only — does NOT alter `ref`.
+    """
+    img = ref.copy()
+
+    if USE_MEDIAN_FILTER:
+        print(f"[preprocess] Applying median filter (radius={MEDIAN_FILTER_RADIUS}).")
+        img = ndimage.median_filter(img, size=MEDIAN_FILTER_RADIUS * 2 + 1)
+
+    # Normalise to [0, 1] for thresholding
+    img_min, img_max = img.min(), img.max()
+    if img_max > img_min:
+        img_norm = (img - img_min) / (img_max - img_min)
+    else:
+        img_norm = np.zeros_like(img, dtype=np.float32)
+
+    if USE_CLAHE:
+        print("[preprocess] Applying CLAHE.")
+        img_norm = exposure.equalize_adapthist(img_norm, clip_limit=0.03)
+
+    return img_norm.astype(np.float32)
+
+
+def make_outer_tissue_mask(ref: np.ndarray) -> np.ndarray:
+    """
+    Create a binary mask of the full tissue region (holes filled).
+    Steps:
+      1. Preprocess reference image.
+      2. Threshold using Otsu's method.
+      3. Morphological closing to bridge small gaps.
+      4. Fill all holes — this mask represents the outer tissue boundary.
+      5. Keep only the largest connected component.
+    Returns a boolean array.
+    """
+    print("[outer_mask] Creating outer tissue mask.")
+    img_norm = preprocess_for_masking(ref)
+
+    # Otsu threshold on normalised image
+    thresh = filters.threshold_otsu(img_norm)
+    print(f"[outer_mask] Otsu threshold (normalised): {thresh:.4f}")
+    binary = img_norm > thresh
+
+    # Morphological closing to fill small gaps at tissue boundary
+    selem = morphology.disk(CLOSING_RADIUS)
+    print(f"[outer_mask] Morphological closing (radius={CLOSING_RADIUS}).")
+    binary = morphology.binary_closing(binary, selem)
+
+    # Fill holes — the outer mask should be a solid region
+    print("[outer_mask] Filling internal holes for outer mask.")
+    binary = ndimage.binary_fill_holes(binary)
+
+    # Keep only the largest connected component (the tissue)
+    labeled = measure.label(binary)
+    if labeled.max() == 0:
+        raise RuntimeError("No tissue detected! Check threshold or input image.")
+    props = measure.regionprops(labeled)
+    largest = max(props, key=lambda r: r.area)
+    print(f"[outer_mask] Largest component area: {largest.area} px²")
+    outer_mask = labeled == largest.label
+
+    return outer_mask.astype(bool)
+
+
+def get_centroid(mask: np.ndarray) -> tuple:
+    """
+    Compute the geometric centroid (center of mass of the binary mask).
+    Returns (x0, y0) in pixel coordinates.
+    Note: skimage regionprops returns (row, col) = (y, x).
+    """
+    labeled = measure.label(mask)
+    props = measure.regionprops(labeled)
+    if not props:
+        raise RuntimeError("Cannot find centroid: mask is empty.")
+    largest = max(props, key=lambda r: r.area)
+    cy, cx = largest.centroid  # row=y, col=x
+    print(f"[centroid] Tissue centroid: x0={cx:.1f}, y0={cy:.1f}")
+    return cx, cy
+
+
+def make_radial_distance_map(shape: tuple, x0: float, y0: float) -> np.ndarray:
+    """
+    Compute the radial distance of every pixel from (x0, y0).
+    Returns float32 array of shape `shape`.
+    """
+    print(f"[radial_map] Computing distance map from ({x0:.1f}, {y0:.1f}).")
+    rows, cols = np.indices(shape)  # rows=y, cols=x
+    dist = np.sqrt((cols - x0) ** 2 + (rows - y0) ** 2)
+    return dist.astype(np.float32)
+
+
+def compute_ring_statistics(
+    ref: np.ndarray,
+    dist_map: np.ndarray,
+    outer_mask: np.ndarray,
+    ring_width: int,
+) -> tuple:
+    """
+    For each radial annulus of width `ring_width`, compute:
+      - ring_median: median intensity of tissue pixels in the ring
+      - ring_mad:    MAD = median(|pixel - ring_median|)
+      - ring_pXX:    HOLE_PERCENTILE-th percentile of tissue pixels in the ring
+
+    Returns:
+      expected_img  : 2D image where each pixel's value = its ring's median
+      threshold_img : 2D image where each pixel's value = detection threshold
+      ring_stats    : list of dicts with per-ring statistics
+    """
+    print(f"[ring_stats] Computing ring statistics (ring_width={ring_width} px).")
+
+    max_dist = dist_map[outer_mask].max()
+    ring_edges = np.arange(0, max_dist + ring_width, ring_width)
+
+    expected_img = np.zeros_like(ref, dtype=np.float32)
+    threshold_img = np.zeros_like(ref, dtype=np.float32)
+    ring_stats = []
+
+    for i in range(len(ring_edges) - 1):
+        r_lo, r_hi = ring_edges[i], ring_edges[i + 1]
+        in_ring = outer_mask & (dist_map >= r_lo) & (dist_map < r_hi)
+        pixels = ref[in_ring]
+
+        if pixels.size < 10:
+            # Too few pixels — skip this ring, leave zeros
+            ring_stats.append({"r_lo": r_lo, "r_hi": r_hi,
+                                "median": np.nan, "mad": np.nan,
+                                "pct": np.nan, "n": pixels.size})
+            continue
+
+        ring_med = np.median(pixels)
+        ring_mad = np.median(np.abs(pixels - ring_med))
+        ring_pct = np.percentile(pixels, HOLE_PERCENTILE)
+
+        expected_img[in_ring] = ring_med
+        if USE_PERCENTILE:
+            threshold_img[in_ring] = ring_pct
+        else:
+            threshold_img[in_ring] = ring_med - K_MAD * ring_mad
+
+        ring_stats.append({
+            "r_lo": r_lo, "r_hi": r_hi,
+            "median": ring_med, "mad": ring_mad,
+            "pct": ring_pct, "n": pixels.size,
+        })
+
+    print(f"[ring_stats] Processed {len(ring_stats)} rings.")
+    return expected_img, threshold_img, ring_stats
+
+
+def detect_holes(
+    ref: np.ndarray,
+    outer_mask: np.ndarray,
+    threshold_img: np.ndarray,
+    min_hole_size: int,
+) -> np.ndarray:
+    """
+    Classify pixels inside the outer tissue mask as holes if their intensity
+    is below the per-ring threshold.
+
+    Steps:
+      1. Compare ref to threshold_img within outer_mask.
+      2. Exclude pixels outside the outer mask.
+      3. Remove small objects (noise).
+      4. Optional morphological opening to clean jagged edges.
+    Returns a boolean hole mask.
+    """
+    print("[holes] Detecting holes via radial thresholding.")
+
+    # Pixels significantly darker than expected for their ring
+    raw_holes = outer_mask & (ref < threshold_img)
+
+    # Remove small noisy objects
+    print(f"[holes] Removing objects smaller than {min_hole_size} px².")
+    hole_mask = morphology.remove_small_objects(raw_holes, min_size=min_hole_size)
+
+    # Optional: gentle opening to remove thin spurs
+    hole_mask = morphology.binary_opening(hole_mask, morphology.disk(2))
+
+    n_holes = measure.label(hole_mask).max()
+    total_px = hole_mask.sum()
+    print(f"[holes] Found {n_holes} hole regions, {total_px} px total.")
+    return hole_mask.astype(bool)
+
+
+def make_final_mask(outer_mask: np.ndarray, hole_mask: np.ndarray) -> np.ndarray:
+    """
+    Final tissue mask = outer tissue mask minus detected holes.
+    Returns uint8 array: 255 = tissue, 0 = hole or background.
+    """
+    final = outer_mask & ~hole_mask
+    return (final * 255).astype(np.uint8)
+
+
+def save_outputs(
+    output_dir: Path,
+    ref: np.ndarray,
+    outer_mask: np.ndarray,
+    hole_mask: np.ndarray,
+    final_mask: np.ndarray,
+    expected_img: np.ndarray,
+    threshold_img: np.ndarray,
+    x0: float,
+    y0: float,
+) -> None:
+    """Save all output TIFF files and a QC overlay PNG."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[save] Writing outputs to: {output_dir}")
+
+    tifffile.imwrite(output_dir / "reference_median.tif", ref.astype(np.float32))
+    tifffile.imwrite(output_dir / "outer_tissue_mask.tif",
+                     (outer_mask * 255).astype(np.uint8))
+    tifffile.imwrite(output_dir / "radial_hole_mask.tif",
+                     (hole_mask * 255).astype(np.uint8))
+    tifffile.imwrite(output_dir / "final_tissue_mask.tif", final_mask)
+    tifffile.imwrite(output_dir / "radial_expected_intensity.tif",
+                     expected_img.astype(np.float32))
+    tifffile.imwrite(output_dir / "radial_threshold_image.tif",
+                     threshold_img.astype(np.float32))
+
+    # ---- QC figure ----
+    fig, axes = plt.subplots(2, 4, figsize=(22, 11))
+    fig.patch.set_facecolor("#1a1a2e")
+
+    def _show(ax, img, title, cmap="gray", vmin=None, vmax=None):
+        ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(title, color="white", fontsize=11, pad=6)
+        ax.axis("off")
+
+    # Robust display range for the reference image
+    p2, p98 = np.percentile(ref, (2, 98))
+
+    _show(axes[0, 0], ref, "Reference (median proj)", vmin=p2, vmax=p98)
+    axes[0, 0].plot(x0, y0, "r+", markersize=18, markeredgewidth=2,
+                    label=f"centroid ({x0:.0f},{y0:.0f})")
+    axes[0, 0].legend(loc="upper right", fontsize=8,
+                      facecolor="#333", labelcolor="white")
+
+    _show(axes[0, 1], outer_mask, "Outer tissue mask", cmap="Blues")
+    _show(axes[0, 2], hole_mask, "Radial hole mask", cmap="Reds")
+    _show(axes[0, 3], final_mask, "Final tissue mask", cmap="Greens")
+
+    # Overlay holes on reference
+    axes[1, 0].imshow(ref, cmap="gray", vmin=p2, vmax=p98, interpolation="nearest")
+    overlay = np.zeros((*ref.shape, 4), dtype=np.float32)
+    overlay[hole_mask] = [1.0, 0.2, 0.2, 0.6]  # red, semi-transparent
+    axes[1, 0].imshow(overlay, interpolation="nearest")
+    axes[1, 0].set_title("Holes overlaid on reference", color="white", fontsize=11)
+    axes[1, 0].axis("off")
+
+    # Expected intensity (ring medians)
+    ei_p2, ei_p98 = np.percentile(expected_img[expected_img > 0], (2, 98)) \
+        if expected_img.max() > 0 else (0, 1)
+    _show(axes[1, 1], expected_img, "Radial expected intensity",
+          vmin=ei_p2, vmax=ei_p98)
+
+    # Threshold image
+    th_p2, th_p98 = np.percentile(threshold_img[threshold_img > 0], (2, 98)) \
+        if threshold_img.max() > 0 else (0, 1)
+    _show(axes[1, 2], threshold_img, "Radial threshold image",
+          vmin=th_p2, vmax=th_p98)
+
+    # Difference: reference minus threshold
+    diff = ref - threshold_img
+    d_abs = np.abs(diff[outer_mask]).max() if outer_mask.any() else 1.0
+    axes[1, 3].imshow(diff, cmap="RdBu_r", vmin=-d_abs, vmax=d_abs,
+                      interpolation="nearest")
+    axes[1, 3].set_title("ref − threshold (blue=hole)", color="white", fontsize=11)
+    axes[1, 3].axis("off")
+
+    for ax in axes.flat:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    plt.suptitle("Radial Hole Detector — QC", color="white",
+                 fontsize=15, fontweight="bold", y=0.99)
+    plt.tight_layout(pad=1.5)
+    qc_path = output_dir / "overlay_QC.png"
+    fig.savefig(qc_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.show()
+    plt.close(fig)
+    print(f"[save] QC figure saved: {qc_path}")
+
+
+# ============================================================
+# MAIN FUNCTION
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print("  Radial Hole Detector")
+    print("=" * 60)
+
+    # ---- 1. Load image ----
+    stack = load_image(INPUT_PATH)
+
+    # ---- 2. Create reference image (median projection) ----
+    ref = make_reference(stack)
+
+    # ---- 3. Create outer tissue mask ----
+    outer_mask = make_outer_tissue_mask(ref)
+
+    # ---- 4. Find tissue centroid ----
+    if AUTO_CENTER:
+        x0, y0 = get_centroid(outer_mask)
+    else:
+        if MANUAL_X0 is None or MANUAL_Y0 is None:
+            raise ValueError("AUTO_CENTER=False but MANUAL_X0/MANUAL_Y0 are not set.")
+        x0, y0 = float(MANUAL_X0), float(MANUAL_Y0)
+        print(f"[centroid] Using manual centroid: x0={x0}, y0={y0}")
+
+    # ---- 5. Compute radial distance map ----
+    dist_map = make_radial_distance_map(ref.shape, x0, y0)
+
+    # ---- 6 & 7. Ring statistics and hole detection threshold ----
+    expected_img, threshold_img, ring_stats = compute_ring_statistics(
+        ref, dist_map, outer_mask, RING_WIDTH
+    )
+
+    # ---- 8. Detect and clean hole mask ----
+    hole_mask = detect_holes(ref, outer_mask, threshold_img, MIN_HOLE_SIZE)
+
+    # ---- 9. Final tissue mask ----
+    final_mask = make_final_mask(outer_mask, hole_mask)
+
+    # ---- 10 & 11. Save outputs and QC figure ----
+    output_dir = Path(OUTPUT_DIR)
+    save_outputs(
+        output_dir, ref, outer_mask, hole_mask, final_mask,
+        expected_img, threshold_img, x0, y0
+    )
+
+    # Print ring statistics summary
+    print("\n[summary] Per-ring statistics (first 10 rings):")
+    print(f"  {'Ring':>6}  {'r_lo':>6}  {'r_hi':>6}  {'n_px':>7}  "
+          f"{'median':>10}  {'mad':>10}  {'thresh':>10}")
+    for i, s in enumerate(ring_stats[:10]):
+        if np.isnan(s["median"]):
+            continue
+        thr = s["pct"] if USE_PERCENTILE else s["median"] - K_MAD * s["mad"]
+        print(f"  {i:>6}  {s['r_lo']:>6.1f}  {s['r_hi']:>6.1f}  {s['n']:>7}  "
+              f"  {s['median']:>10.1f}  {s['mad']:>10.2f}  {thr:>10.1f}")
+
+    print("\n[done] All outputs written to:", output_dir.resolve())
+    print("       Files:")
+    for f in sorted(output_dir.iterdir()):
+        print(f"         {f.name}")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
