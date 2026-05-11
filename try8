@@ -4,6 +4,7 @@ from PIL import Image, ImageDraw, ImageTk
 import math
 import random
 import os
+import statistics
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -17,6 +18,293 @@ MATTEK_SIZES = {
     "24-well plate": 2.6,
     "96-well plate": 0.8,                                                                                                                      
 }
+
+def _rect_inside_circle_fraction(rx, ry, cx, cy, half_length, half_width, radius, samples=5):
+    """Estimate fraction of rectangle that lies inside a circle via uniform sampling."""
+    r2 = radius * radius
+    count = 0
+    for i in range(samples):
+        sx = rx - half_length + (2 * half_length * i / (samples - 1)) if samples > 1 else rx
+        for j in range(samples):
+            sy = ry - half_width + (2 * half_width * j / (samples - 1)) if samples > 1 else ry
+            if (sx - cx) ** 2 + (sy - cy) ** 2 <= r2:
+                count += 1
+    return count / (samples * samples)
+
+
+def _render_pdf_first_page_to_image(pdf_path, scale=4.0):
+    """Render first page of a PDF to a PIL image.
+
+    Tries pypdfium2 first, then PyMuPDF (fitz) as fallback.
+    """
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(pdf_path)
+        if len(doc) == 0:
+            raise ValueError("PDF has no pages")
+        page = doc[0]
+        bitmap = page.render(scale=scale)
+        image = bitmap.to_pil().convert("RGB")
+        page.close()
+        doc.close()
+        return image
+    except Exception:
+        pass
+
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        if doc.page_count == 0:
+            raise ValueError("PDF has no pages")
+        page = doc.load_page(0)
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        doc.close()
+        return image
+    except Exception as ex:
+        raise RuntimeError(
+            "Could not read PDF page. Install pypdfium2 (preferred) or PyMuPDF."
+        ) from ex
+
+
+def _estimate_rectangles_and_spacing_from_circle(img_l, cx, cy, radius, threshold):
+    """Estimate rectangle length/width and spacing from a binarized circle region.
+
+    Returns measurements in pixels as a dict, or None if detection is insufficient.
+    """
+    def _cluster_axis(values, tolerance):
+        if not values:
+            return []
+        values = sorted(values)
+        groups = [[values[0]]]
+        for value in values[1:]:
+            if abs(value - statistics.mean(groups[-1])) <= tolerance:
+                groups[-1].append(value)
+            else:
+                groups.append([value])
+        return groups
+
+    def _robust_median(samples):
+        if not samples:
+            return None
+        samples = sorted(samples)
+        if len(samples) < 5:
+            return statistics.median(samples)
+        q1 = samples[len(samples) // 4]
+        q3 = samples[(3 * len(samples)) // 4]
+        iqr = max(1e-9, q3 - q1)
+        low = q1 - 1.5 * iqr
+        high = q3 + 1.5 * iqr
+        trimmed = [value for value in samples if low <= value <= high]
+        return statistics.median(trimmed if trimmed else samples)
+
+    def _detect_once(local_threshold):
+        width, height = img_l.size
+        pixels = img_l.load()
+
+        xmin = max(0, int(cx - radius - 1))
+        xmax = min(width - 1, int(cx + radius + 1))
+        ymin = max(0, int(cy - radius - 1))
+        ymax = min(height - 1, int(cy + radius + 1))
+
+        bw_w = xmax - xmin + 1
+        bw_h = ymax - ymin + 1
+        if bw_w < 10 or bw_h < 10:
+            return None
+
+        size = bw_w * bw_h
+        black = bytearray(size)
+        visited = bytearray(size)
+        r2 = radius * radius
+
+        for local_y in range(bw_h):
+            y = ymin + local_y
+            dy = y - cy
+            row_base = local_y * bw_w
+            for local_x in range(bw_w):
+                x = xmin + local_x
+                dx = x - cx
+                if dx * dx + dy * dy <= r2 and pixels[x, y] <= local_threshold:
+                    black[row_base + local_x] = 1
+
+        components = []
+        min_area = max(6, int((radius * 0.01) ** 2))
+        max_area = int(max(400, (math.pi * radius * radius) * 0.08))
+
+        for idx in range(size):
+            if not black[idx] or visited[idx]:
+                continue
+
+            stack = [idx]
+            visited[idx] = 1
+
+            n = 0
+            sum_x = 0.0
+            sum_y = 0.0
+            sum_xx = 0.0
+            sum_yy = 0.0
+            sum_xy = 0.0
+
+            while stack:
+                cur = stack.pop()
+                cy_local = cur // bw_w
+                cx_local = cur - cy_local * bw_w
+
+                gx = xmin + cx_local
+                gy = ymin + cy_local
+
+                n += 1
+                sum_x += gx
+                sum_y += gy
+                sum_xx += gx * gx
+                sum_yy += gy * gy
+                sum_xy += gx * gy
+
+                for ny in (cy_local - 1, cy_local, cy_local + 1):
+                    if ny < 0 or ny >= bw_h:
+                        continue
+                    for nx in (cx_local - 1, cx_local, cx_local + 1):
+                        if nx < 0 or nx >= bw_w or (nx == cx_local and ny == cy_local):
+                            continue
+                        nxt = ny * bw_w + nx
+                        if black[nxt] and not visited[nxt]:
+                            visited[nxt] = 1
+                            stack.append(nxt)
+
+            if n < min_area or n > max_area:
+                continue
+
+            mean_x = sum_x / n
+            mean_y = sum_y / n
+            var_x = max(0.0, (sum_xx / n) - (mean_x * mean_x))
+            var_y = max(0.0, (sum_yy / n) - (mean_y * mean_y))
+            cov_xy = (sum_xy / n) - (mean_x * mean_y)
+
+            trace = var_x + var_y
+            det = var_x * var_y - cov_xy * cov_xy
+            disc = max(0.0, (trace * trace * 0.25) - det)
+            root_disc = math.sqrt(disc)
+            eig1 = max(0.0, trace * 0.5 + root_disc)
+            eig2 = max(0.0, trace * 0.5 - root_disc)
+
+            length_px = math.sqrt(12.0 * eig1) if eig1 > 0 else 0.0
+            width_px = math.sqrt(12.0 * eig2) if eig2 > 0 else 0.0
+            if length_px < width_px:
+                length_px, width_px = width_px, length_px
+
+            if length_px < 2.0 or width_px < 1.0:
+                continue
+
+            theta = 0.5 * math.atan2(2.0 * cov_xy, (var_x - var_y))
+
+            components.append({
+                "center_x": mean_x,
+                "center_y": mean_y,
+                "length_px": length_px,
+                "width_px": width_px,
+                "theta": theta,
+            })
+
+        if len(components) < 5:
+            return None
+
+        lengths = [comp["length_px"] for comp in components if comp["length_px"] > 0]
+        widths = [comp["width_px"] for comp in components if comp["width_px"] > 0]
+        if len(lengths) < 4 or len(widths) < 4:
+            return None
+
+        length_est = _robust_median(lengths)
+        width_est = _robust_median(widths)
+        if not length_est or not width_est or length_est <= 0 or width_est <= 0:
+            return None
+
+        angles = [comp["theta"] for comp in components]
+        sin2 = statistics.mean(math.sin(2.0 * angle) for angle in angles)
+        cos2 = statistics.mean(math.cos(2.0 * angle) for angle in angles)
+        theta = 0.5 * math.atan2(sin2, cos2)
+
+        u_x = math.cos(theta)
+        u_y = math.sin(theta)
+        v_x = -u_y
+        v_y = u_x
+
+        centers = []
+        for comp in components:
+            x = comp["center_x"]
+            y = comp["center_y"]
+            pu = x * u_x + y * u_y
+            pv = x * v_x + y * v_y
+            centers.append((pu, pv))
+
+        row_tol = max(2.0, width_est * 0.9)
+        col_tol = max(2.0, length_est * 0.9)
+
+        rows = _cluster_axis([value[1] for value in centers], row_tol)
+        cols = _cluster_axis([value[0] for value in centers], col_tol)
+        row_centers = [statistics.mean(group) for group in rows]
+        col_centers = [statistics.mean(group) for group in cols]
+
+        along_periods = []
+        across_periods = []
+
+        for row_center in row_centers:
+            row_values = sorted(
+                value[0] for value in centers
+                if abs(value[1] - row_center) <= row_tol
+            )
+            for i in range(1, len(row_values)):
+                delta = row_values[i] - row_values[i - 1]
+                if delta > 1.0:
+                    along_periods.append(delta)
+
+        for col_center in col_centers:
+            col_values = sorted(
+                value[1] for value in centers
+                if abs(value[0] - col_center) <= col_tol
+            )
+            for i in range(1, len(col_values)):
+                delta = col_values[i] - col_values[i - 1]
+                if delta > 1.0:
+                    across_periods.append(delta)
+
+        period_along = _robust_median(along_periods)
+        period_across = _robust_median(across_periods)
+        if period_along is None or period_across is None:
+            return None
+
+        if period_along <= 0 or period_across <= 0:
+            return None
+
+        spacing_along = max(0.0, period_along - length_est)
+        spacing_across = max(0.0, period_across - width_est)
+
+        return {
+            "rect_length_px": length_est,
+            "rect_width_px": width_est,
+            "spacing_along_px": spacing_along,
+            "spacing_across_px": spacing_across,
+            "period_along_px": period_along,
+            "period_across_px": period_across,
+            "components": len(components),
+        }
+
+    candidates = []
+    for delta in (0, 16, -16, 28, -28, 40, -40):
+        t = max(0, min(255, int(threshold + delta)))
+        if t not in candidates:
+            candidates.append(t)
+
+    best = None
+    for local_threshold in candidates:
+        detected = _detect_once(local_threshold)
+        if detected is None:
+            continue
+        if best is None or detected["components"] > best["components"]:
+            best = detected
+
+    return best
+
 
 # ========== INTERSTITIAL PATTERN (RECTANGULAR MESH) ==========
 def add_interstitial(c, cx, cy, radius_pt, coverage, rect_length_mm, rect_width_mm, 
@@ -37,23 +325,13 @@ def add_interstitial(c, cx, cy, radius_pt, coverage, rect_length_mm, rect_width_
     spacing_along_pt = spacing_along_mm * mm
     spacing_across_pt = spacing_across_mm * mm
     
-    # Calculate actual coverage based on rectangle and spacing
-    area_per_unit = (rect_length_pt + spacing_along_pt) * (rect_width_pt + spacing_across_pt)
-    area_rect = rect_length_pt * rect_width_pt
-    actual_coverage = area_rect / area_per_unit if area_per_unit > 0 else 0
-    
-    # Adjust rectangle size to match target coverage
-    if actual_coverage > 0 and actual_coverage < 0.99:
-        scale_factor = math.sqrt(coverage / actual_coverage)
-        adjusted_length_pt = rect_length_pt * scale_factor
-        adjusted_width_pt = rect_width_pt * scale_factor
-    else:
-        adjusted_length_pt = rect_length_pt
-        adjusted_width_pt = rect_width_pt
-    
+    # Also remove unused fill_fraction variable in PDF path
+    # Use a single fixed grid; coverage controls occupancy of grid slots
+    # (fill_fraction replaced by area-accumulation below)
+
     # Create grid of rectangles
-    period_along = adjusted_length_pt + spacing_along_pt
-    period_across = adjusted_width_pt + spacing_across_pt
+    period_along = rect_length_pt + spacing_along_pt
+    period_across = rect_width_pt + spacing_across_pt
     
     # Calculate how many rectangles fit
     diag = radius_pt * 3
@@ -69,22 +347,45 @@ def add_interstitial(c, cx, cy, radius_pt, coverage, rect_length_mm, rect_width_
     c.rotate(angle_deg)
     c.translate(-cx, -cy)
     c.setFillColor(colors.black)
-    
-    # Draw rectangles in grid
+
+    candidates = []
     for i in range(num_along):
         for j in range(num_across):
             x = cx + start_along + i * period_along
             y = cy + start_across + j * period_across
-            
+
             # Apply indentation to every other row
             if j % 2 == 1:
                 x += period_along * (indentation / 100.0)
-            
-            # Only draw if within circle (rough check)
+
             dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-            if dist <= radius_pt + adjusted_length_pt:
-                c.rect(x - adjusted_length_pt / 2.0, y - adjusted_width_pt / 2.0,
-                       adjusted_length_pt, adjusted_width_pt, stroke=0, fill=1)
+            if dist <= radius_pt + rect_length_pt:
+                candidates.append((x, y))
+
+    if not candidates:
+        c.restoreState()
+        return
+
+    candidates.sort(key=lambda pos: ((pos[0] - cx) ** 2 + (pos[1] - cy) ** 2))
+
+    # Accumulate weighted coverage until target is reached so achieved == target
+    circle_area = math.pi * radius_pt * radius_pt
+    target_area = coverage * circle_area
+    rect_area = rect_length_pt * rect_width_pt
+    half_l = rect_length_pt / 2.0
+    half_w = rect_width_pt / 2.0
+    accumulated = 0.0
+    draw_list = []
+    for x, y in candidates:
+        if accumulated >= target_area:
+            break
+        frac = _rect_inside_circle_fraction(x, y, cx, cy, half_l, half_w, radius_pt)
+        accumulated += frac * rect_area
+        draw_list.append((x, y))
+
+    for x, y in draw_list:
+        c.rect(x - half_l, y - half_w,
+               rect_length_pt, rect_width_pt, stroke=0, fill=1)
     
     c.restoreState()
 
@@ -97,23 +398,12 @@ def add_interstitial_preview(draw, cx, cy, radius_px, coverage, rect_length_px, 
     spacing_along_px = max(1.0, spacing_along_px)
     spacing_across_px = max(1.0, spacing_across_px)
     
-    # Calculate actual coverage
-    area_per_unit = (rect_length_px + spacing_along_px) * (rect_width_px + spacing_across_px)
-    area_rect = rect_length_px * rect_width_px
-    actual_coverage = area_rect / area_per_unit if area_per_unit > 0 else 0
-    
-    # Adjust rectangle size to match target coverage
-    if actual_coverage > 0 and actual_coverage < 0.99:
-        scale_factor = math.sqrt(coverage / actual_coverage)
-        adjusted_length_px = rect_length_px * scale_factor
-        adjusted_width_px = rect_width_px * scale_factor
-    else:
-        adjusted_length_px = rect_length_px
-        adjusted_width_px = rect_width_px
-    
+    # Use a single fixed grid; coverage controls occupancy of grid slots
+    # (fill_fraction replaced by area-accumulation below)
+
     # Create grid
-    period_along = adjusted_length_px + spacing_along_px
-    period_across = adjusted_width_px + spacing_across_px
+    period_along = rect_length_px + spacing_along_px
+    period_across = rect_width_px + spacing_across_px
     
     diag = radius_px * 3
     num_along = int(math.ceil(diag * 2 / period_along)) + 4
@@ -125,43 +415,156 @@ def add_interstitial_preview(draw, cx, cy, radius_px, coverage, rect_length_px, 
     angle = math.radians(angle_deg)
     cos_a = math.cos(angle)
     sin_a = math.sin(angle)
-    
-    # Draw rectangles
+
+    candidates = []
     for i in range(num_along):
         for j in range(num_across):
             x = start_along + i * period_along
             y = start_across + j * period_across
-            
+
             # Apply indentation to every other row
             if j % 2 == 1:
                 x += period_along * (indentation / 100.0)
-            
+
             # Rotate around center
             x_rot = cx + x * cos_a - y * sin_a
             y_rot = cy + x * sin_a + y * cos_a
-            
-            # Only draw if within circle
+
             dist = math.sqrt((x_rot - cx) ** 2 + (y_rot - cy) ** 2)
-            if dist <= radius_px + adjusted_length_px:
-                # Rectangle corners
-                half_length = adjusted_length_px / 2.0
-                half_width = adjusted_width_px / 2.0
-                
-                corners = [
-                    (-half_length, -half_width),
-                    (half_length, -half_width),
-                    (half_length, half_width),
-                    (-half_length, half_width)
-                ]
-                
-                # Rotate corners
-                points = []
-                for dx, dy in corners:
-                    px = x_rot + dx * cos_a - dy * sin_a
-                    py = y_rot + dx * sin_a + dy * cos_a
-                    points.append((px, py))
-                
-                draw.polygon(points, fill=0, outline=0)
+            if dist <= radius_px + rect_length_px:
+                candidates.append((x_rot, y_rot))
+
+    if not candidates:
+        return
+
+    candidates.sort(key=lambda pos: ((pos[0] - cx) ** 2 + (pos[1] - cy) ** 2))
+
+    # Accumulate weighted coverage until target is reached so achieved == target
+    circle_area = math.pi * radius_px * radius_px
+    target_area = coverage * circle_area
+    rect_area = rect_length_px * rect_width_px
+    half_length = rect_length_px / 2.0
+    half_width = rect_width_px / 2.0
+    accumulated = 0.0
+    draw_list = []
+    for x_rot, y_rot in candidates:
+        if accumulated >= target_area:
+            break
+        frac = _rect_inside_circle_fraction(x_rot, y_rot, cx, cy, half_length, half_width, radius_px)
+        accumulated += frac * rect_area
+        draw_list.append((x_rot, y_rot))
+
+    corners = [
+        (-half_length, -half_width),
+        (half_length, -half_width),
+        (half_length, half_width),
+        (-half_length, half_width)
+    ]
+
+    for x_rot, y_rot in draw_list:
+        points = []
+        for dx, dy in corners:
+            px = x_rot + dx * cos_a - dy * sin_a
+            py = y_rot + dx * sin_a + dy * cos_a
+            points.append((px, py))
+        draw.polygon(points, fill=0, outline=0)
+
+def _estimate_diffuse_coverage(rectangles, radius_units, rect_length_units, rect_width_units, mask_size=700):
+    """Estimate diffuse coverage fraction inside circular region using rasterization"""
+    if radius_units <= 0:
+        return 0.0
+
+    mask = Image.new("L", (mask_size, mask_size), 0)
+    draw_mask = ImageDraw.Draw(mask)
+    tissue = Image.new("L", (mask_size, mask_size), 0)
+    draw_tissue = ImageDraw.Draw(tissue)
+
+    cx = cy = mask_size / 2.0
+    scale = (mask_size * 0.45) / radius_units
+    r_px = radius_units * scale
+
+    draw_tissue.ellipse((cx - r_px, cy - r_px, cx + r_px, cy + r_px), fill=255)
+
+    half_length = rect_length_units / 2.0
+    half_width = rect_width_units / 2.0
+
+    for x_u, y_u, angle_deg in rectangles:
+        angle_rad = math.radians(angle_deg)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+
+        corners = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width),
+        ]
+
+        points = []
+        for dx, dy in corners:
+            rx = dx * cos_a - dy * sin_a
+            ry = dx * sin_a + dy * cos_a
+            points.append((cx + (x_u + rx) * scale, cy + (y_u + ry) * scale))
+
+        draw_mask.polygon(points, fill=255, outline=255)
+
+    tissue_data = tissue.tobytes()
+    mask_data = mask.tobytes()
+    tissue_pixels = 0
+    covered_pixels = 0
+    for i in range(len(tissue_data)):
+        if tissue_data[i] > 0:
+            tissue_pixels += 1
+            if mask_data[i] > 0:
+                covered_pixels += 1
+
+    return (covered_pixels / tissue_pixels) if tissue_pixels > 0 else 0.0
+
+def generate_diffuse_layout(radius_units, target_coverage, rect_length_units, rect_width_units, randomness, max_rects=30000):
+    """Generate diffuse rectangle layout that matches target coverage"""
+    if target_coverage <= 0 or radius_units <= 0 or rect_length_units <= 0 or rect_width_units <= 0:
+        return []
+
+    target = max(0.0, min(0.99, target_coverage))
+    area_circle = math.pi * radius_units ** 2
+    area_rect = rect_length_units * rect_width_units
+    if area_rect <= 0:
+        return []
+
+    expected_count = max(1, int((target * area_circle) / area_rect))
+    rectangles = []
+    coverage_now = 0.0
+    batch = max(20, min(500, expected_count // 4 if expected_count > 0 else 20))
+
+    while coverage_now < target and len(rectangles) < max_rects:
+        to_add = min(batch, max_rects - len(rectangles))
+        for _ in range(to_add):
+            angle = random.uniform(0, 2 * math.pi)
+            r_factor = random.uniform(0, 1) ** 0.5
+            r = radius_units * r_factor
+
+            px = r * math.cos(angle)
+            py = r * math.sin(angle)
+
+            rect_angle = random.uniform(0, 180)
+            scatter = randomness * rect_length_units
+            px += random.uniform(-scatter, scatter)
+            py += random.uniform(-scatter, scatter)
+
+            rectangles.append((px, py, rect_angle))
+
+        coverage_now = _estimate_diffuse_coverage(
+            rectangles,
+            radius_units,
+            rect_length_units,
+            rect_width_units,
+        )
+
+        remaining = max(0.0, target - coverage_now)
+        est_more = int((remaining * area_circle) / area_rect * 1.5) + 10
+        batch = max(10, min(800, est_more))
+
+    return rectangles
 
 # ========== PATCHY PATTERN (IRREGULAR ISLANDS) ==========
 def add_patchy(c, cx, cy, radius_pt, coverage, island_size_mm, num_islands, density=1.0):
@@ -429,6 +832,23 @@ class PatternCreatorApp:
         self.preview_image_full = None
         self.zoom_level = 1.0
         self.last_seed = None
+        self.pdf_analysis_result_text = tk.StringVar(value="")
+
+        self.pdf_analysis_window = None
+        self.pdf_analysis_canvas = None
+        self.pdf_analysis_photo = None
+        self.pdf_analysis_image_full = None
+        self.pdf_analysis_image_display = None
+        self.pdf_analysis_image_id = None
+        self.pdf_analysis_scale = 1.0
+        self.pdf_analysis_base_scale = 1.0
+        self.pdf_analysis_zoom_level = 1.0
+        self.pdf_circle_center_img = None
+        self.pdf_circle_edge_img = None
+        self.pdf_zoom_label = None
+        self.pdf_black_threshold = tk.IntVar(value=128)
+        self.pdf_mesh_info_var = tk.StringVar(value="")
+        self.pdf_mesh_period_var = tk.StringVar(value="")
         
         self._build_widgets()
         self.on_preview()
@@ -437,6 +857,7 @@ class PatternCreatorApp:
         # Variables
         self.var_pattern_type = tk.StringVar(value="Interstitial")
         self.var_mattek_size = tk.StringVar(value="35mm dish (10mm well)")
+        self.var_complete_to_10mm = tk.BooleanVar(value=False)
         self.var_coverage = tk.DoubleVar(value=20.0)
         self.var_white_border = tk.DoubleVar(value=15.0)
         
@@ -479,8 +900,29 @@ class PatternCreatorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         
-        controls = ttk.Frame(main)
-        controls.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        controls_container = ttk.Frame(main)
+        controls_container.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        controls_v_scroll = ttk.Scrollbar(controls_container, orient="vertical")
+        self.controls_canvas = tk.Canvas(
+            controls_container,
+            highlightthickness=0,
+            yscrollcommand=controls_v_scroll.set,
+            width=360,
+        )
+        controls_v_scroll.config(command=self.controls_canvas.yview)
+
+        self.controls_canvas.grid(row=0, column=0, sticky="nsew")
+        controls_v_scroll.grid(row=0, column=1, sticky="ns")
+        controls_container.rowconfigure(0, weight=1)
+        controls_container.columnconfigure(0, weight=1)
+
+        controls = ttk.Frame(self.controls_canvas)
+        self.controls_window_id = self.controls_canvas.create_window((0, 0), window=controls, anchor="nw")
+        controls.bind("<Configure>", self._update_controls_scrollregion)
+        self.controls_canvas.bind("<Configure>", self._on_controls_canvas_configure)
+        self.controls_canvas.bind("<Enter>", self._bind_controls_mousewheel)
+        self.controls_canvas.bind("<Leave>", self._unbind_controls_mousewheel)
         
         preview_frame = ttk.Frame(main)
         preview_frame.grid(row=0, column=1, sticky="nsew")
@@ -506,17 +948,26 @@ class PatternCreatorApp:
         mattek_menu.grid(row=row, column=1, sticky="ew", pady=2)
         mattek_menu.bind("<<ComboboxSelected>>", self.on_preview)
         row += 1
+
+        complete_to_10_check = ttk.Checkbutton(
+            controls,
+            text="Complete white circle to 10 mm (for wells < 10 mm)",
+            variable=self.var_complete_to_10mm,
+            command=self.on_preview,
+        )
+        complete_to_10_check.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
         
         # Coverage
-        self._add_slider(controls, row, "Total coverage (%):", self.var_coverage, 0, 95, "%",
-                        callback=self.on_preview)
+        self._add_entry(controls, row, "Total coverage (%):", self.var_coverage, "%",
+                   callback=self.on_preview)
         ttk.Label(controls, text="  (of entire circle)", 
                  font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         
         # White border
-        self._add_slider(controls, row, "White border (% radius):", self.var_white_border, 0, 40, "%",
-                        callback=self.on_preview)
+        self._add_entry(controls, row, "White border (% radius):", self.var_white_border, "%",
+                   callback=self.on_preview)
         ttk.Label(controls, text="  (for electrical propagation)", 
                  font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
@@ -533,14 +984,34 @@ class PatternCreatorApp:
         self.inner_coverage_label = ttk.Label(self.coverage_info_frame, text="Inner pattern coverage: 0%", 
                                               font=("TkDefaultFont", 9, "italic"))
         self.inner_coverage_label.pack(anchor="w", pady=2)
+
+        self.completion_mode_label = ttk.Label(self.coverage_info_frame, text="",
+                               font=("TkDefaultFont", 9, "italic"))
+        self.completion_mode_label.pack(anchor="w", pady=2)
+
+        self.achieved_coverage_label = ttk.Label(self.coverage_info_frame, text="",
+                                                 font=("TkDefaultFont", 9, "italic"))
+        self.achieved_coverage_label.pack(anchor="w", pady=2)
         
-        self.actual_rect_length_label = ttk.Label(self.coverage_info_frame, text="Adjusted rect length: 0 µm",
+        self.actual_rect_length_label = ttk.Label(self.coverage_info_frame, text="Rect length: 0 µm (fixed)",
                                                   font=("TkDefaultFont", 9, "italic"))
         self.actual_rect_length_label.pack(anchor="w", pady=2)
         
-        self.actual_rect_width_label = ttk.Label(self.coverage_info_frame, text="Adjusted rect width: 0 µm",
+        self.actual_rect_width_label = ttk.Label(self.coverage_info_frame, text="Grid occupancy: 0.0%",
                                                  font=("TkDefaultFont", 9, "italic"))
         self.actual_rect_width_label.pack(anchor="w", pady=2)
+
+        self.mesh_period_label = ttk.Label(self.coverage_info_frame, text="Mesh period: 0 × 0 µm",
+                           font=("TkDefaultFont", 9, "italic"))
+        self.mesh_period_label.pack(anchor="w", pady=2)
+
+        self.mesh_density_label = ttk.Label(self.coverage_info_frame, text="Intrinsic grid occupancy: 0.0%",
+                            font=("TkDefaultFont", 9, "italic"))
+        self.mesh_density_label.pack(anchor="w", pady=2)
+
+        self.pdf_analysis_label = ttk.Label(self.coverage_info_frame, textvariable=self.pdf_analysis_result_text,
+                            font=("TkDefaultFont", 9, "italic"))
+        self.pdf_analysis_label.pack(anchor="w", pady=2)
         
         # Interstitial parameters frame
         self.params_frame = ttk.LabelFrame(controls, text="Rectangle Mesh Parameters", padding=5)
@@ -566,7 +1037,9 @@ class PatternCreatorApp:
         btn_frame = ttk.Frame(controls)
         btn_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         btn_generate = ttk.Button(btn_frame, text="Generate PDF", command=self.on_generate)
-        btn_generate.pack(side="left", fill="x", expand=True)
+        btn_generate.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        btn_analyze = ttk.Button(btn_frame, text="Analyze PDF", command=self.on_analyze_pdf)
+        btn_analyze.pack(side="left", fill="x", expand=True, padx=(4, 0))
         btn_frame.columnconfigure(0, weight=1)
         
         # Preview area with zoom controls
@@ -615,6 +1088,35 @@ class PatternCreatorApp:
         self.preview_canvas.bind("<Button-1>", self.on_canvas_press)
         self.preview_canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.preview_canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+
+        self.root.after_idle(self._update_controls_scrollregion)
+
+    def _update_controls_scrollregion(self, event=None):
+        """Update scrolling bounds for controls panel"""
+        self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all"))
+
+    def _on_controls_canvas_configure(self, event):
+        """Keep controls panel width synced to canvas viewport"""
+        self.controls_canvas.itemconfigure(self.controls_window_id, width=event.width)
+
+    def _on_controls_mousewheel(self, event):
+        """Scroll controls panel with mouse wheel"""
+        if event.num == 5 or event.delta < 0:
+            self.controls_canvas.yview_scroll(1, "units")
+        elif event.num == 4 or event.delta > 0:
+            self.controls_canvas.yview_scroll(-1, "units")
+
+    def _bind_controls_mousewheel(self, event=None):
+        """Enable mouse wheel scrolling when cursor enters controls panel"""
+        self.controls_canvas.bind_all("<MouseWheel>", self._on_controls_mousewheel)
+        self.controls_canvas.bind_all("<Button-4>", self._on_controls_mousewheel)
+        self.controls_canvas.bind_all("<Button-5>", self._on_controls_mousewheel)
+
+    def _unbind_controls_mousewheel(self, event=None):
+        """Disable controls-panel wheel binding when cursor leaves"""
+        self.controls_canvas.unbind_all("<MouseWheel>")
+        self.controls_canvas.unbind_all("<Button-4>")
+        self.controls_canvas.unbind_all("<Button-5>")
 
     def on_pattern_change(self, event=None):
         """Update parameter controls based on selected pattern type"""
@@ -711,6 +1213,7 @@ class PatternCreatorApp:
                          font=("TkDefaultFont", 8, "italic")).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 2))
         
         self.on_preview()
+        self.root.after_idle(self._update_controls_scrollregion)
 
     def _add_entry(self, parent, row, label, var, unit, callback=None):
         """Add labeled entry field"""
@@ -724,6 +1227,7 @@ class PatternCreatorApp:
         # Bind callback on Enter key
         if callback:
             entry.bind("<Return>", lambda e: callback())
+            entry.bind("<FocusOut>", lambda e: callback())
         
         ttk.Label(frame, text=unit, width=6).pack(side="left")
         
@@ -752,6 +1256,7 @@ class PatternCreatorApp:
     
     def _update_coverage_info(self):
         """Update coverage information display"""
+        diameter = MATTEK_SIZES[self.var_mattek_size.get()]
         total_coverage = self.var_coverage.get() / 100.0
         white_border = self.var_white_border.get() / 100.0
         
@@ -766,6 +1271,11 @@ class PatternCreatorApp:
         else:
             inner_coverage = 0
         self.inner_coverage_label.config(text=f"Inner pattern coverage: {inner_coverage:.1f}%")
+
+        if self.var_complete_to_10mm.get() and diameter < 10.0:
+            self.completion_mode_label.config(text="10 mm white completion: ON")
+        else:
+            self.completion_mode_label.config(text="")
         
         # Calculate adjusted rectangle dimensions
         rect_length_mm = self.var_rect_length.get() / 1000.0
@@ -776,22 +1286,32 @@ class PatternCreatorApp:
         # Calculate coverage from current parameters
         area_per_unit = (rect_length_mm + spacing_along_mm) * (rect_width_mm + spacing_across_mm)
         area_rect = rect_length_mm * rect_width_mm
-        actual_coverage = area_rect / area_per_unit if area_per_unit > 0 else 0
-        
-        # Calculate scale factor needed
-        inner_coverage_fraction = inner_coverage / 100.0
-        if actual_coverage > 0 and actual_coverage < 0.99:
-            scale_factor = math.sqrt(inner_coverage_fraction / actual_coverage)
-        else:
-            scale_factor = 1.0
-        
-        adjusted_length_µm = rect_length_mm * scale_factor * 1000.0
-        adjusted_width_µm = rect_width_mm * scale_factor * 1000.0
-        
+        natural_grid_density = area_rect / area_per_unit if area_per_unit > 0 else 0
+        max_grid_coverage_total = natural_grid_density * area_ratio
+
+        period_along_µm = (rect_length_mm + spacing_along_mm) * 1000.0
+        period_across_µm = (rect_width_mm + spacing_across_mm) * 1000.0
+        self.mesh_period_label.config(
+            text=f"Mesh period: {period_along_µm:.1f} × {period_across_µm:.1f} µm")
+        self.mesh_density_label.config(
+            text=f"Intrinsic grid occupancy: {natural_grid_density * 100:.1f}%")
+
+        rect_length_µm = rect_length_mm * 1000.0
         self.actual_rect_length_label.config(
-            text=f"Adjusted rect length: {adjusted_length_µm:.1f} µm (scale: {scale_factor:.2f}x)")
-        self.actual_rect_width_label.config(
-            text=f"Adjusted rect width: {adjusted_width_µm:.1f} µm (scale: {scale_factor:.2f}x)")
+            text=f"Rect length: {rect_length_µm:.1f} µm (fixed)")
+
+        if self.var_pattern_type.get() == "Interstitial":
+            max_pct = max_grid_coverage_total * 100
+            if total_coverage > max_grid_coverage_total + 0.001:
+                self.actual_rect_width_label.config(
+                    text=f"⚠ Target exceeds grid max ({max_pct:.1f}%). All slots filled.",
+                    foreground="red")
+            else:
+                self.actual_rect_width_label.config(
+                    text=f"Grid max coverage: {max_pct:.1f}%",
+                    foreground="black")
+        else:
+            self.actual_rect_width_label.config(text="", foreground="black")
     
     def on_preview(self, event=None):
         """Generate preview image and update coverage info"""
@@ -800,8 +1320,61 @@ class PatternCreatorApp:
         self.last_seed = random.randint(0, 10**9)
         params = self._current_params()
         
-        self.preview_image_full = render_pattern_image(size_px=800, **params)
+        self.preview_image_full = render_pattern_image(size_px=800, seed=self.last_seed, **params)
+        self._update_achieved_coverage_info(params)
         self._update_canvas()
+
+    def _update_achieved_coverage_info(self, params):
+        """Update achieved coverage readout from rendered preview for all patterns"""
+        if self.preview_image_full is None:
+            self.achieved_coverage_label.config(text="")
+            return
+
+        white_border_fraction = params.get("white_border_fraction", 0.15)
+        border_clamped = max(0.0, min(0.9, white_border_fraction))
+
+        outer_radius_px = 800 * 0.45
+        inner_radius_px = outer_radius_px * (1.0 - border_clamped)
+
+        img_l = self.preview_image_full.convert("L")
+        width, height = img_l.size
+        cx = width / 2.0
+        cy = height / 2.0
+
+        pixels = img_l.load()
+
+        outer_count = 0
+        outer_black = 0
+        inner_count = 0
+        inner_black = 0
+
+        xmin = max(0, int(cx - outer_radius_px - 1))
+        xmax = min(width - 1, int(cx + outer_radius_px + 1))
+        ymin = max(0, int(cy - outer_radius_px - 1))
+        ymax = min(height - 1, int(cy + outer_radius_px + 1))
+
+        outer_r2 = outer_radius_px * outer_radius_px
+        inner_r2 = inner_radius_px * inner_radius_px
+
+        for y in range(ymin, ymax + 1):
+            dy = y - cy
+            for x in range(xmin, xmax + 1):
+                dx = x - cx
+                d2 = dx * dx + dy * dy
+                if d2 <= outer_r2:
+                    outer_count += 1
+                    if pixels[x, y] < 128:
+                        outer_black += 1
+                    if d2 <= inner_r2:
+                        inner_count += 1
+                        if pixels[x, y] < 128:
+                            inner_black += 1
+
+        achieved_total = (outer_black / outer_count) if outer_count > 0 else 0.0
+        achieved_inner = (inner_black / inner_count) if inner_count > 0 else 0.0
+
+        self.achieved_coverage_label.config(
+            text=f"Achieved coverage: {achieved_total * 100:.1f}% total ({achieved_inner * 100:.1f}% inner)")
 
     def _current_params(self):
         """Get current pattern parameters"""
@@ -813,6 +1386,7 @@ class PatternCreatorApp:
             "pattern_type": self.var_pattern_type.get(),
             "coverage": coverage,
             "circle_diameter_mm": diameter,
+            "complete_to_10mm": self.var_complete_to_10mm.get(),
             "white_border_fraction": white_border,
             "rect_length_mm": self.var_rect_length.get() / 1000.0,
             "rect_width_mm": self.var_rect_width.get() / 1000.0,
@@ -848,13 +1422,323 @@ class PatternCreatorApp:
         file_path = filedialog.asksaveasfilename(
             defaultextension=".pdf",
             filetypes=[("PDF files", "*.pdf")],
-            initialdir=os.path.expanduser("~\Desktop")
+            initialdir=os.path.expanduser(r"~\Desktop")
         )
         
         if file_path:
             params = self._current_params()
             generate_pattern(file_path, **params, seed=self.last_seed)
             messagebox.showinfo("Success", f"Pattern saved to:\n{file_path}")
+
+    def on_analyze_pdf(self):
+        """Upload a PDF and open an analysis dialog to measure black area in a selected circle."""
+        pdf_path = filedialog.askopenfilename(
+            title="Select PDF to analyze",
+            filetypes=[("PDF files", "*.pdf")],
+            initialdir=os.path.expanduser(r"~\Desktop")
+        )
+        if not pdf_path:
+            return
+
+        try:
+            img = _render_pdf_first_page_to_image(pdf_path, scale=4.0)
+        except Exception as ex:
+            messagebox.showerror(
+                "PDF load error",
+                f"Could not open PDF first page.\n\n{ex}\n\n"
+                "Install one of these packages and retry:\n"
+                "pip install pypdfium2\n"
+                "or\n"
+                "pip install pymupdf"
+            )
+            return
+
+        self._open_pdf_analysis_dialog(img, pdf_path)
+
+    def _open_pdf_analysis_dialog(self, image, pdf_path):
+        if self.pdf_analysis_window and self.pdf_analysis_window.winfo_exists():
+            self.pdf_analysis_window.destroy()
+
+        win = tk.Toplevel(self.root)
+        win.title("Analyze PDF fibrosis %")
+        win.geometry("1050x800")
+        self.pdf_analysis_window = win
+
+        self.pdf_analysis_image_full = image
+
+        max_w, max_h = 980, 640
+        scale_w = max_w / max(1, image.width)
+        scale_h = max_h / max(1, image.height)
+        self.pdf_analysis_base_scale = min(1.0, scale_w, scale_h)
+        self.pdf_analysis_zoom_level = 1.0
+        self.pdf_analysis_scale = self.pdf_analysis_base_scale
+
+        top_info = ttk.Frame(win, padding=8)
+        top_info.pack(fill="x")
+        ttk.Label(
+            top_info,
+            text=(
+                f"File: {os.path.basename(pdf_path)} | "
+                "Step 1: click circle center, Step 2: click circle edge, Step 3: Analyze"
+            ),
+            font=("TkDefaultFont", 9)
+        ).pack(side="left", anchor="w")
+
+        controls = ttk.Frame(win, padding=(8, 0, 8, 8))
+        controls.pack(fill="x")
+
+        ttk.Label(controls, text="Zoom:").pack(side="left")
+        ttk.Button(controls, text="-", width=3, command=self._pdf_zoom_out).pack(side="left", padx=(6, 2))
+        self.pdf_zoom_label = ttk.Label(controls, text="100%", width=6)
+        self.pdf_zoom_label.pack(side="left", padx=2)
+        ttk.Button(controls, text="+", width=3, command=self._pdf_zoom_in).pack(side="left", padx=2)
+        ttk.Button(controls, text="Reset", width=6, command=self._pdf_zoom_reset).pack(side="left", padx=(2, 12))
+
+        ttk.Label(controls, text="Black threshold (0-255):").pack(side="left")
+        threshold_entry = ttk.Entry(controls, textvariable=self.pdf_black_threshold, width=6)
+        threshold_entry.pack(side="left", padx=(6, 12))
+
+        ttk.Button(controls, text="Reset selection", command=self._reset_pdf_circle_selection).pack(side="left", padx=4)
+        ttk.Button(controls, text="Analyze circle", command=self._compute_pdf_fibrosis_percentage).pack(side="left", padx=4)
+
+        self.pdf_analysis_result_var = tk.StringVar(value="Circle not selected yet")
+        ttk.Label(controls, textvariable=self.pdf_analysis_result_var, font=("TkDefaultFont", 9, "italic")).pack(side="left", padx=12)
+
+        mesh_info_frame = ttk.Frame(win, padding=(8, 0, 8, 6))
+        mesh_info_frame.pack(fill="x")
+        ttk.Label(mesh_info_frame, textvariable=self.pdf_mesh_info_var, font=("TkDefaultFont", 9, "italic")).pack(anchor="w")
+        ttk.Label(mesh_info_frame, textvariable=self.pdf_mesh_period_var, font=("TkDefaultFont", 9, "italic")).pack(anchor="w")
+        self._update_pdf_mesh_info_labels()
+
+        canvas_frame = ttk.Frame(win, padding=8)
+        canvas_frame.pack(fill="both", expand=True)
+
+        h_scroll = ttk.Scrollbar(canvas_frame, orient="horizontal")
+        v_scroll = ttk.Scrollbar(canvas_frame, orient="vertical")
+
+        self.pdf_analysis_canvas = tk.Canvas(
+            canvas_frame,
+            bg="black",
+            xscrollcommand=h_scroll.set,
+            yscrollcommand=v_scroll.set,
+        )
+
+        h_scroll.config(command=self.pdf_analysis_canvas.xview)
+        v_scroll.config(command=self.pdf_analysis_canvas.yview)
+
+        self.pdf_analysis_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self.pdf_analysis_image_id = self.pdf_analysis_canvas.create_image(0, 0, anchor="nw", tags="pdf_image")
+        self._refresh_pdf_analysis_view()
+
+        self.pdf_circle_center_img = None
+        self.pdf_circle_edge_img = None
+        self.pdf_analysis_canvas.bind("<Button-1>", self._on_pdf_analysis_click)
+        self.pdf_analysis_canvas.bind("<Control-MouseWheel>", self._on_pdf_analysis_mouse_wheel)
+        self.pdf_analysis_canvas.bind("<Control-Button-4>", self._on_pdf_analysis_mouse_wheel)
+        self.pdf_analysis_canvas.bind("<Control-Button-5>", self._on_pdf_analysis_mouse_wheel)
+
+    def _refresh_pdf_analysis_view(self):
+        if self.pdf_analysis_image_full is None or self.pdf_analysis_canvas is None:
+            return
+
+        self.pdf_analysis_scale = max(1e-9, self.pdf_analysis_base_scale * self.pdf_analysis_zoom_level)
+        disp_w = max(1, int(self.pdf_analysis_image_full.width * self.pdf_analysis_scale))
+        disp_h = max(1, int(self.pdf_analysis_image_full.height * self.pdf_analysis_scale))
+
+        self.pdf_analysis_image_display = self.pdf_analysis_image_full.resize((disp_w, disp_h), Image.Resampling.LANCZOS)
+        self.pdf_analysis_photo = ImageTk.PhotoImage(self.pdf_analysis_image_display)
+
+        self.pdf_analysis_canvas.itemconfig(self.pdf_analysis_image_id, image=self.pdf_analysis_photo)
+        self.pdf_analysis_canvas.config(scrollregion=(0, 0, disp_w, disp_h))
+
+        if self.pdf_zoom_label:
+            self.pdf_zoom_label.config(text=f"{int(self.pdf_analysis_zoom_level * 100)}%")
+
+        self._draw_pdf_circle_overlay()
+
+    def _update_pdf_mesh_info_labels(self):
+        pattern_type = self.var_pattern_type.get()
+        if pattern_type != "Interstitial":
+            self.pdf_mesh_info_var.set("Mesh dimensions: available in Interstitial mode")
+            self.pdf_mesh_period_var.set("")
+            return
+
+        rect_length_um = self.var_rect_length.get()
+        rect_width_um = self.var_rect_width.get()
+        spacing_along_um = self.var_spacing_along.get()
+        spacing_across_um = self.var_spacing_across.get()
+
+        period_along_um = rect_length_um + spacing_along_um
+        period_across_um = rect_width_um + spacing_across_um
+
+        area_per_unit = (period_along_um * period_across_um)
+        area_rect = rect_length_um * rect_width_um
+        occupancy = (area_rect / area_per_unit * 100.0) if area_per_unit > 0 else 0.0
+
+        self.pdf_mesh_info_var.set(
+            f"Rect: {rect_length_um:.1f} × {rect_width_um:.1f} µm | Spacing: {spacing_along_um:.1f}/{spacing_across_um:.1f} µm")
+        self.pdf_mesh_period_var.set(
+            f"Period: {period_along_um:.1f} × {period_across_um:.1f} µm | Intrinsic occupancy: {occupancy:.1f}%")
+
+    def _show_detected_pdf_mesh_info(self, detected, circle_radius_px):
+        diameter_mm = MATTEK_SIZES[self.var_mattek_size.get()]
+        if self.var_complete_to_10mm.get() and diameter_mm < 10.0:
+            diameter_mm = 10.0
+
+        px_per_mm = circle_radius_px / max(1e-9, diameter_mm / 2.0)
+        um_per_px = 1000.0 / max(1e-9, px_per_mm)
+
+        rect_length_um = detected["rect_length_px"] * um_per_px
+        rect_width_um = detected["rect_width_px"] * um_per_px
+        spacing_along_um = detected["spacing_along_px"] * um_per_px
+        spacing_across_um = detected["spacing_across_px"] * um_per_px
+        period_along_um = detected["period_along_px"] * um_per_px
+        period_across_um = detected["period_across_px"] * um_per_px
+
+        area_rect = rect_length_um * rect_width_um
+        area_period = period_along_um * period_across_um
+        occupancy = (area_rect / area_period * 100.0) if area_period > 0 else 0.0
+
+        self.pdf_mesh_info_var.set(
+            f"Detected from PDF: Rect ~{rect_length_um:.1f} × {rect_width_um:.1f} µm | "
+            f"Spacing ~{spacing_along_um:.1f}/{spacing_across_um:.1f} µm")
+        self.pdf_mesh_period_var.set(
+            f"Detected period: {period_along_um:.1f} × {period_across_um:.1f} µm | "
+            f"Occupancy: {occupancy:.1f}% (n={detected['components']})")
+
+    def _pdf_zoom_in(self):
+        self.pdf_analysis_zoom_level = min(8.0, self.pdf_analysis_zoom_level * 1.25)
+        self._refresh_pdf_analysis_view()
+
+    def _pdf_zoom_out(self):
+        self.pdf_analysis_zoom_level = max(0.2, self.pdf_analysis_zoom_level / 1.25)
+        self._refresh_pdf_analysis_view()
+
+    def _pdf_zoom_reset(self):
+        self.pdf_analysis_zoom_level = 1.0
+        self._refresh_pdf_analysis_view()
+
+    def _on_pdf_analysis_mouse_wheel(self, event):
+        if event.num == 5 or event.delta < 0:
+            self._pdf_zoom_out()
+        elif event.num == 4 or event.delta > 0:
+            self._pdf_zoom_in()
+
+    def _reset_pdf_circle_selection(self):
+        self.pdf_circle_center_img = None
+        self.pdf_circle_edge_img = None
+        if self.pdf_analysis_canvas:
+            self.pdf_analysis_canvas.delete("pdf_circle_overlay")
+        if hasattr(self, "pdf_analysis_result_var"):
+            self.pdf_analysis_result_var.set("Circle not selected yet")
+
+    def _on_pdf_analysis_click(self, event):
+        if not self.pdf_analysis_canvas:
+            return
+
+        x_disp = self.pdf_analysis_canvas.canvasx(event.x)
+        y_disp = self.pdf_analysis_canvas.canvasy(event.y)
+
+        scale = max(1e-9, self.pdf_analysis_scale)
+        x = x_disp / scale
+        y = y_disp / scale
+
+        if self.pdf_circle_center_img is None:
+            self.pdf_circle_center_img = (x, y)
+            self.pdf_circle_edge_img = None
+        else:
+            self.pdf_circle_edge_img = (x, y)
+
+        self._draw_pdf_circle_overlay()
+
+    def _draw_pdf_circle_overlay(self):
+        if not self.pdf_analysis_canvas:
+            return
+
+        self.pdf_analysis_canvas.delete("pdf_circle_overlay")
+        if self.pdf_circle_center_img is None:
+            return
+
+        scale = max(1e-9, self.pdf_analysis_scale)
+        cx = self.pdf_circle_center_img[0] * scale
+        cy = self.pdf_circle_center_img[1] * scale
+        r_cross = 6
+        self.pdf_analysis_canvas.create_line(cx - r_cross, cy, cx + r_cross, cy, fill="yellow", width=2, tags="pdf_circle_overlay")
+        self.pdf_analysis_canvas.create_line(cx, cy - r_cross, cx, cy + r_cross, fill="yellow", width=2, tags="pdf_circle_overlay")
+
+        if self.pdf_circle_edge_img is not None:
+            ex = self.pdf_circle_edge_img[0] * scale
+            ey = self.pdf_circle_edge_img[1] * scale
+            radius = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
+            self.pdf_analysis_canvas.create_oval(
+                cx - radius, cy - radius, cx + radius, cy + radius,
+                outline="yellow", width=2, tags="pdf_circle_overlay"
+            )
+
+    def _compute_pdf_fibrosis_percentage(self):
+        if self.pdf_analysis_image_full is None:
+            messagebox.showwarning("No image", "No PDF image loaded.")
+            return
+
+        if self.pdf_circle_center_img is None or self.pdf_circle_edge_img is None:
+            messagebox.showwarning("Select circle", "Click center then edge to define the circle.")
+            return
+
+        threshold = max(0, min(255, int(self.pdf_black_threshold.get())))
+        self.pdf_black_threshold.set(threshold)
+
+        cx, cy = self.pdf_circle_center_img
+        ex, ey = self.pdf_circle_edge_img
+        radius = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
+        if radius < (2.0 / max(1e-9, self.pdf_analysis_scale)):
+            messagebox.showwarning("Invalid circle", "Circle radius is too small.")
+            return
+
+        img_l = self.pdf_analysis_image_full.convert("L")
+        pixels = img_l.load()
+        width, height = img_l.size
+
+        xmin = max(0, int(cx - radius - 1))
+        xmax = min(width - 1, int(cx + radius + 1))
+        ymin = max(0, int(cy - radius - 1))
+        ymax = min(height - 1, int(cy + radius + 1))
+
+        total = 0
+        black = 0
+        r2 = radius * radius
+
+        for y in range(ymin, ymax + 1):
+            dy = y - cy
+            for x in range(xmin, xmax + 1):
+                dx = x - cx
+                if dx * dx + dy * dy <= r2:
+                    total += 1
+                    if pixels[x, y] <= threshold:
+                        black += 1
+
+        fibrosis_pct = (black / total * 100.0) if total > 0 else 0.0
+
+        result_text = f"PDF fibrosis (selected circle): {fibrosis_pct:.2f}% black"
+        self.pdf_analysis_result_var.set(result_text)
+        self.pdf_analysis_result_text.set(result_text)
+
+        detected = _estimate_rectangles_and_spacing_from_circle(
+            img_l=img_l,
+            cx=cx,
+            cy=cy,
+            radius=radius,
+            threshold=threshold,
+        )
+        if detected is not None:
+            self._show_detected_pdf_mesh_info(detected, radius)
+        else:
+            self.pdf_mesh_info_var.set("Detected from PDF: could not reliably estimate rectangle/spacing")
+            self.pdf_mesh_period_var.set("Try re-selecting the circle tighter around the patterned region")
     
     def zoom_in(self):
         """Increase zoom"""
@@ -916,7 +1800,8 @@ class PatternCreatorApp:
             # Convert canvas pixels to mm
             diameter = MATTEK_SIZES[self.var_mattek_size.get()]
             circle_radius_mm = diameter / 2.0
-            pixels_per_mm = 400 / circle_radius_mm
+            pattern_outer_radius_px = 800 * 0.45
+            pixels_per_mm = pattern_outer_radius_px / circle_radius_mm
             dx_mm = dx_canvas / (pixels_per_mm * self.zoom_level)
             dy_mm = dy_canvas / (pixels_per_mm * self.zoom_level)
             
@@ -965,28 +1850,36 @@ class PatternCreatorApp:
         self.compact_offset_mode = False
 
 # ========== RENDER AND GENERATE FUNCTIONS ==========
-def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15, seed=None, **kwargs):
+def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15,
+                         complete_to_10mm=False, seed=None, **kwargs):
     """Render preview image"""
     if seed is not None:
         random.seed(seed)
     
-    base = Image.new("L", (size_px, size_px), 0)
+    pattern_diameter_mm = circle_diameter_mm
+    display_diameter_mm = 10.0 if (complete_to_10mm and pattern_diameter_mm < 10.0) else pattern_diameter_mm
+    display_scale = display_diameter_mm / pattern_diameter_mm if pattern_diameter_mm > 0 else 1.0
+    output_size_px = int(round(size_px * max(1.0, display_scale)))
+
+    base = Image.new("L", (output_size_px, output_size_px), 0)
     draw_base = ImageDraw.Draw(base)
-    cx = cy = size_px / 2.0
-    radius_px = size_px * 0.45
+    cx = cy = output_size_px / 2.0
+    pattern_outer_radius_px = size_px * 0.45
+    display_radius_px = pattern_outer_radius_px * (display_diameter_mm / pattern_diameter_mm)
     
     # Draw outer white circle
-    draw_base.ellipse((cx - radius_px, cy - radius_px, cx + radius_px, cy + radius_px), fill=255)
+    draw_base.ellipse((cx - display_radius_px, cy - display_radius_px,
+                      cx + display_radius_px, cy + display_radius_px), fill=255)
     
     # Calculate pattern region (with white border)
-    pattern_radius_px = radius_px * (1.0 - max(0.0, min(0.9, white_border_fraction)))
+    pattern_radius_px = pattern_outer_radius_px * (1.0 - max(0.0, min(0.9, white_border_fraction)))
     
     # Calculate inner coverage needed
-    area_ratio = (pattern_radius_px / radius_px) ** 2
+    area_ratio = (pattern_radius_px / pattern_outer_radius_px) ** 2
     inner_coverage = coverage / area_ratio if area_ratio > 0 else 0
     inner_coverage = min(0.99, inner_coverage)
     
-    tissue = Image.new("L", (size_px, size_px), 255)
+    tissue = Image.new("L", (output_size_px, output_size_px), 255)
     draw_t = ImageDraw.Draw(tissue)
     
     if pattern_type == "Interstitial":
@@ -1013,41 +1906,38 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
         
         rect_length_px = (rect_length_mm / circle_diameter_mm) * (2 * pattern_radius_px)
         rect_width_px = (rect_width_mm / circle_diameter_mm) * (2 * pattern_radius_px)
-        
-        # Create diffuse preview (randomized rectangles)
-        for _ in range(int((inner_coverage * math.pi * pattern_radius_px ** 2) / (rect_length_px * rect_width_px))):
-            angle = random.uniform(0, 2 * math.pi)
-            r_factor = random.uniform(0, 1) ** 0.5
-            r = pattern_radius_px * r_factor
-            px = cx + r * math.cos(angle)
-            py = cy + r * math.sin(angle)
-            
-            rect_angle = random.uniform(0, 180)
-            scatter = randomness * rect_length_px
-            px += random.uniform(-scatter, scatter)
-            py += random.uniform(-scatter, scatter)
-            
-            # Rotate and draw rectangle
+
+        # Create diffuse preview from coverage-matched layout
+        layout = generate_diffuse_layout(
+            pattern_radius_px,
+            inner_coverage,
+            rect_length_px,
+            rect_width_px,
+            randomness,
+        )
+
+        half_length = rect_length_px / 2.0
+        half_width = rect_width_px / 2.0
+        corners = [
+            (-half_length, -half_width),
+            (half_length, -half_width),
+            (half_length, half_width),
+            (-half_length, half_width),
+        ]
+
+        for lx, ly, rect_angle in layout:
+            px = cx + lx
+            py = cy + ly
             angle_rad = math.radians(rect_angle)
             cos_a = math.cos(angle_rad)
             sin_a = math.sin(angle_rad)
-            
-            half_length = rect_length_px / 2.0
-            half_width = rect_width_px / 2.0
-            
-            corners = [
-                (-half_length, -half_width),
-                (half_length, -half_width),
-                (half_length, half_width),
-                (-half_length, half_width)
-            ]
-            
+
             points = []
             for dx, dy in corners:
                 rx = dx * cos_a - dy * sin_a
                 ry = dx * sin_a + dy * cos_a
                 points.append((px + rx, py + ry))
-            
+
             draw_t.polygon(points, fill=0, outline=0)
     
     elif pattern_type == "Patchy":
@@ -1083,7 +1973,7 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
                            right_offset_x_px, right_offset_y_px, split_rotation_right)
     
     # Mask to pattern region
-    mask = Image.new("L", (size_px, size_px), 0)
+    mask = Image.new("L", (output_size_px, output_size_px), 0)
     draw_m = ImageDraw.Draw(mask)
     draw_m.ellipse((cx - pattern_radius_px, cy - pattern_radius_px, 
                    cx + pattern_radius_px, cy + pattern_radius_px), fill=255)
@@ -1091,16 +1981,21 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
     
     return base.convert("RGB")
 
-def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15, seed=None, **kwargs):
+def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15,
+                     complete_to_10mm=False, seed=None, **kwargs):
     """Generate PDF pattern"""
     if seed is not None:
         random.seed(seed)
     
-    dummy_size = circle_diameter_mm * mm + 4 * mm
+    pattern_diameter_mm = circle_diameter_mm
+    display_diameter_mm = 10.0 if (complete_to_10mm and pattern_diameter_mm < 10.0) else pattern_diameter_mm
+
+    dummy_size = display_diameter_mm * mm + 4 * mm
     c = canvas.Canvas(filename, pagesize=(dummy_size, dummy_size))
     
     cx, cy = dummy_size / 2.0, dummy_size / 2.0
-    radius_pt = circle_diameter_mm * mm / 2.0
+    display_radius_pt = display_diameter_mm * mm / 2.0
+    pattern_outer_radius_pt = pattern_diameter_mm * mm / 2.0
     
     # Black background
     c.setFillColor(colors.black)
@@ -1108,19 +2003,19 @@ def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white
     
     # White circle (tissue region)
     c.setFillColor(colors.white)
-    c.circle(cx, cy, radius_pt, stroke=0, fill=1)
+    c.circle(cx, cy, display_radius_pt, stroke=0, fill=1)
     
     # Clip to circle for pattern
     c.saveState()
     p = c.beginPath()
-    p.circle(cx, cy, radius_pt)
+    p.circle(cx, cy, pattern_outer_radius_pt)
     c.clipPath(p, stroke=0, fill=0)
     
     # Calculate pattern region
-    pattern_radius_pt = radius_pt * (1.0 - max(0.0, min(0.9, white_border_fraction)))
+    pattern_radius_pt = pattern_outer_radius_pt * (1.0 - max(0.0, min(0.9, white_border_fraction)))
     
     # Calculate inner coverage
-    area_ratio = (pattern_radius_pt / radius_pt) ** 2
+    area_ratio = (pattern_radius_pt / pattern_outer_radius_pt) ** 2
     inner_coverage = coverage / area_ratio if area_ratio > 0 else 0
     inner_coverage = min(0.99, inner_coverage)
     
@@ -1154,20 +2049,19 @@ def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white
         
         c.setFillColor(colors.black)
         
-        # Draw randomized rectangles
-        num_rects = int((inner_coverage * math.pi * pattern_radius_pt ** 2) / (rect_length_pt * rect_width_pt))
-        for _ in range(num_rects):
-            angle = random.uniform(0, 2 * math.pi)
-            r_factor = random.uniform(0, 1) ** 0.5
-            r = pattern_radius_pt * r_factor
-            px = cx + r * math.cos(angle)
-            py = cy + r * math.sin(angle)
-            
-            rect_angle = random.uniform(0, 180)
-            scatter = randomness * rect_length_pt
-            px += random.uniform(-scatter, scatter)
-            py += random.uniform(-scatter, scatter)
-            
+        # Draw coverage-matched diffuse layout
+        layout = generate_diffuse_layout(
+            pattern_radius_pt,
+            inner_coverage,
+            rect_length_pt,
+            rect_width_pt,
+            randomness,
+        )
+
+        for lx, ly, rect_angle in layout:
+            px = cx + lx
+            py = cy + ly
+
             c.saveState()
             c.translate(px, py)
             c.rotate(rect_angle)
