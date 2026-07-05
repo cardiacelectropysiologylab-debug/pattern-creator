@@ -822,6 +822,346 @@ def draw_irregular_circle_preview(draw, cx, cy, radius_px, irregularity, rotatio
         
         draw.polygon(points, fill=0, outline=0)
 
+
+# ========== PATCHY ZIG-ZAG PATTERN ==========
+def _polygon_area(points):
+    """Return the signed area of a polygon defined by points."""
+    if len(points) < 3:
+        return 0.0
+    s = 0.0
+    for i in range(len(points)):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % len(points)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) * 0.5
+
+
+def _generate_zigzag_centerlines(cx, cy, radius_px, num_corridors, amplitude_px, frequency, circle_diameter_mm):
+    """Generate centerline polylines (list of point lists) for zig-zag corridors.
+
+    Polylines run from top (y = cy - radius) to bottom (y = cy + radius).
+    Uses a combination of low- and high-frequency sinusoids plus vertical-varying amplitude
+    to create more tortuous, biologically plausible corridors.
+    """
+    lines = []
+    diam = 2.0 * radius_px
+    # horizontal spacing for corridor centers across circle
+    spans = [((i + 1) / (num_corridors + 1.0) - 0.5) * diam for i in range(num_corridors)]
+    for i, span in enumerate(spans):
+        pts = []
+        # sample along y; more samples for smoother curves
+        samples = max(120, int(diam))
+        phase = random.uniform(0, 2 * math.pi)
+        hf_phase = random.uniform(0, 2 * math.pi)
+        for s in range(samples + 1):
+            t = s / samples
+            y = cy - radius_px + t * (2.0 * radius_px)
+            # base low-frequency zig-zag
+            base = math.sin(2.0 * math.pi * frequency * t + (i * math.pi / max(1, num_corridors)))
+            # add smaller high-frequency meanders
+            high = 0.35 * math.sin(2.0 * math.pi * (frequency * 3.0) * t + hf_phase)
+            # amplitude envelope so zig-zag can vary along length
+            amp_env = 0.6 + 0.4 * math.sin(2.0 * math.pi * (t * 1.3) + phase)
+            x = cx + span + amplitude_px * amp_env * (base + high)
+            pts.append((x, y))
+        lines.append(pts)
+    return lines
+
+
+def add_patchy_zigzag_preview(draw, cx, cy, radius_px, inner_coverage,
+                              circle_diameter_mm, avg_island_size_mm, island_var, num_islands,
+                              island_density, clustering, corridor_width_mm, zigzag_amplitude_mm,
+                              zigzag_frequency, num_corridors, seed=None, show_centers=False):
+    """Preview for Patchy Zig-Zag pattern.
+
+    Strategy:
+    - Generate continuous zig-zag corridor centerlines with extra small-scale jitter to increase tortuosity.
+    - Reserve corridor bands (no islands placed inside them).
+    - Create clusters of islands along corridor edges and fill remaining islands elsewhere.
+    - Draw irregular island polygons similar to `add_patchy_preview`.
+    - Optionally draw corridor centerlines for debugging.
+    """
+    if inner_coverage <= 0 or num_islands <= 0:
+        return
+
+    if seed:
+        random.seed(seed)
+
+    # convert mm->px scale based on display circle diameter
+    mm_to_px = (2.0 * radius_px) / max(1e-9, circle_diameter_mm)
+    corridor_width_px = max(1.0, corridor_width_mm * mm_to_px)
+    amplitude_px = zigzag_amplitude_mm * mm_to_px
+
+    # Build centerlines with extra jitter for tortuosity
+    # increase samples for smoother, more tortuous paths
+    base_lines = _generate_zigzag_centerlines(cx, cy, radius_px, num_corridors, amplitude_px, zigzag_frequency, circle_diameter_mm)
+    lines = []
+    for i, base in enumerate(base_lines):
+        jittered = []
+        jitter_scale = max(1.0, amplitude_px * 0.12)
+        for (x, y) in base:
+            # add small per-point jitter (deterministic under seed)
+            jx = x + random.uniform(-jitter_scale, jitter_scale)
+            jy = y + random.uniform(-jitter_scale * 0.2, jitter_scale * 0.2)
+            jittered.append((jx, jy))
+        lines.append(jittered)
+
+    # target black area
+    circle_area = math.pi * radius_px * radius_px
+    target_area = inner_coverage * circle_area
+
+    # island parameters
+    avg_island_d_px = max(1.0, avg_island_size_mm * mm_to_px)
+    avg_island_area_px = max(1.0, math.pi * (avg_island_d_px * 0.5) ** 2 * 0.7)
+    # derive a coverage-driven island count so the requested black fraction is reached
+    N_islands = max(int(max(1, num_islands)),
+                    int(math.ceil(target_area * max(0.25, island_density) * 1.2 / max(1.0, avg_island_area_px))))
+
+    accumulated = 0.0
+
+    islands = []  # list of (cx,cy,radius_px)
+
+    # First, create clustered islands along corridor edges
+    cluster_fraction = max(0.0, min(1.0, clustering))
+    # more aggressive clustering when clustering is high
+    clusters_per_corridor = max(4, int(max(4, N_islands * cluster_fraction / max(1, num_corridors))))
+    islands_per_cluster = max(1, int(max(1, (N_islands * cluster_fraction) // max(1, clusters_per_corridor * num_corridors))))
+
+    # Precompute flattened centerline points for quick distance checks
+    center_pts = [(px, py) for line in lines for (px, py) in line]
+
+    for i, line in enumerate(lines):
+        # choose cluster positions along the line
+        L = len(line)
+        for cidx in range(clusters_per_corridor):
+            tpos = int(((cidx + 0.5) / clusters_per_corridor) * (L - 1))
+            lx, ly = line[tpos]
+            # approximate local normal
+            p0 = line[max(0, tpos - 2)]
+            p1 = line[min(L - 1, tpos + 2)]
+            dx = p1[0] - p0[0]
+            dy = p1[1] - p0[1]
+            nx = -dy
+            nyv = dx
+            norm = math.hypot(nx, nyv) + 1e-9
+            nx /= norm
+            nyv /= norm
+
+            # alternate side and vary offset to create tortuous corridor edges
+            side = -1 if (cidx % 2 == 0) else 1
+            edge_offset = corridor_width_px * 0.5 + avg_island_d_px * 0.6
+            variable_offset = edge_offset * (0.8 + 0.4 * random.random())
+            ccx = lx + nx * (variable_offset * side)
+            ccy = ly + nyv * (variable_offset * side)
+
+            # generate islands around cluster center
+            for j in range(islands_per_cluster):
+                rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
+                rad = max(1.0, (avg_island_d_px * 0.5) * rvar)
+                # small gaussian spread, biased towards corridor edge
+                sx = random.gauss(ccx, rad * 0.9) + nx * random.uniform(-rad, rad) * 0.3
+                sy = random.gauss(ccy, rad * 0.9) + nyv * random.uniform(-rad, rad) * 0.3
+                # accept if inside circle and not inside corridor band
+                if (sx - cx) ** 2 + (sy - cy) ** 2 <= radius_px ** 2:
+                    # distance to nearest centerline (use precomputed pts)
+                    dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
+                    if dmin >= corridor_width_px * 0.45:
+                        islands.append((sx, sy, rad))
+
+    # Fill remaining islands randomly outside corridors
+    remaining = N_islands - len(islands)
+    attempts = 0
+    while remaining > 0 and attempts < max(200, N_islands * 100):
+        attempts += 1
+        t = random.random()
+        r_factor = math.sqrt(t)
+        ang = random.uniform(0, 2 * math.pi)
+        sx = cx + r_factor * radius_px * math.cos(ang)
+        sy = cy + r_factor * radius_px * math.sin(ang)
+        # ensure outside corridor band (leave corridor_width_px/2 clear)
+        dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
+        if dmin < corridor_width_px * 0.5:
+            continue
+        rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
+        rad = max(1.0, (avg_island_d_px * 0.5) * rvar)
+        islands.append((sx, sy, rad))
+        remaining -= 1
+
+    # Draw islands until the actual circular coverage reaches the target.
+    coverage_img = Image.new("L", (int(2 * radius_px + 2), int(2 * radius_px + 2)), 255)
+    coverage_draw = ImageDraw.Draw(coverage_img)
+    coverage_mask = Image.new("L", coverage_img.size, 0)
+    mask_draw = ImageDraw.Draw(coverage_mask)
+    mask_draw.ellipse((0, 0, coverage_img.size[0] - 1, coverage_img.size[1] - 1), fill=255)
+    mask_pixels = sum(1 for p in coverage_mask.getdata() if p > 0)
+    offset_x = cx - radius_px
+    offset_y = cy - radius_px
+
+    for sx, sy, rad in islands:
+        # build irregular polygon as in add_patchy_preview
+        n_points = 28
+        points = []
+        num_harmonics = 4
+        amplitudes = [random.uniform(0.15, 0.45) for _ in range(num_harmonics)]
+        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
+        for i in range(n_points):
+            angle = (2 * math.pi * i) / n_points
+            r_variation = 0.0
+            for h in range(num_harmonics):
+                freq = h + 1
+                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
+            r_variation /= num_harmonics
+            r_local = rad * (1.0 + 0.7 * r_variation)
+            x = sx + r_local * math.cos(angle)
+            y = sy + r_local * math.sin(angle)
+            points.append((x, y))
+        local_points = [(x - offset_x, y - offset_y) for x, y in points]
+        coverage_draw.polygon(local_points, fill=0, outline=0)
+        draw.polygon(points, fill=0, outline=0)
+        black_pixels = sum(1 for mask_val, cov_val in zip(coverage_mask.getdata(), coverage_img.getdata())
+                          if mask_val > 0 and cov_val == 0)
+        if black_pixels / max(1, mask_pixels) >= inner_coverage:
+            break
+
+    # Optionally draw corridor centerlines for visualization (thin)
+    if show_centers:
+        line_width = max(1, int(corridor_width_px * 0.12))
+        for line in lines:
+            # darker gray for visibility on preview
+            draw.line(line, fill=128, width=line_width)
+
+
+def add_patchy_zigzag(c, cx, cy, radius_pt, inner_coverage,
+                     circle_diameter_mm, avg_island_size_mm, island_var, num_islands,
+                     island_density, clustering, corridor_width_mm, zigzag_amplitude_mm,
+                     zigzag_frequency, num_corridors, seed=None):
+    """Draw Patchy Zig-Zag pattern into PDF canvas (points units = pt/mm via mm conversion)."""
+    if inner_coverage <= 0 or num_islands <= 0:
+        return
+
+    if seed:
+        random.seed(seed)
+
+    # convert mm->pt: 1 mm == mm (points multiplier is already included by caller using mm*mm)
+    # Here radius_pt is in points; circle_diameter_mm known
+    mm_to_pt = (2.0 * radius_pt) / max(1e-9, circle_diameter_mm)
+    corridor_width_pt = max(0.5, corridor_width_mm * mm_to_pt)
+    amplitude_pt = zigzag_amplitude_mm * mm_to_pt
+
+    # Generate centerlines in pt
+    lines = []
+    diam = 2.0 * radius_pt
+    spans = [((i + 1) / (num_corridors + 1.0) - 0.5) * diam for i in range(num_corridors)]
+    for i, span in enumerate(spans):
+        pts = []
+        samples = max(60, int(diam // 2))
+        for s in range(samples + 1):
+            t = s / samples
+            y = cy - radius_pt + t * (2.0 * radius_pt)
+            x = cx + span + amplitude_pt * math.sin(2.0 * math.pi * zigzag_frequency * t + (i * math.pi / max(1, num_corridors)))
+            pts.append((x, y))
+        lines.append(pts)
+
+    # target area
+    circle_area = math.pi * radius_pt * radius_pt
+    target_area = inner_coverage * circle_area
+
+    islands = []
+    avg_island_d_pt = max(1.0, avg_island_size_mm * mm_to_pt)
+    avg_island_area_pt = max(1.0, math.pi * (avg_island_d_pt * 0.5) ** 2 * 0.7)
+    N_islands = max(int(max(1, num_islands)),
+                    int(math.ceil(target_area * max(0.25, island_density) * 1.2 / max(1.0, avg_island_area_pt))))
+
+    # clustered islands along corridor edges
+    cluster_fraction = max(0.0, min(1.0, clustering))
+    clusters_per_corridor = max(3, int(N_islands * cluster_fraction / max(1, num_corridors)))
+    islands_per_cluster = max(1, int((N_islands * cluster_fraction) // max(1, clusters_per_corridor * num_corridors)))
+
+    for i, line in enumerate(lines):
+        L = len(line)
+        for cidx in range(clusters_per_corridor):
+            tpos = int(((cidx + 0.5) / clusters_per_corridor) * (L - 1))
+            lx, ly = line[tpos]
+            px1, py1 = line[max(0, tpos - 1)]
+            px2, py2 = line[min(L - 1, tpos + 1)]
+            dx = px2 - px1
+            dy = py2 - py1
+            nx = -dy
+            nyv = dx
+            norm = math.hypot(nx, nyv) + 1e-9
+            nx /= norm
+            nyv /= norm
+            side = -1 if (cidx % 2 == 0) else 1
+            offset = (corridor_width_pt / 2.0 + (avg_island_size_mm * mm_to_pt * 0.5) * 0.6) * side
+            ccx = lx + nx * offset
+            ccy = ly + nyv * offset
+            for j in range(islands_per_cluster):
+                rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
+                rad = max(0.5 * mm_to_pt, (avg_island_size_mm * mm_to_pt * 0.5) * rvar)
+                sx = random.gauss(ccx, rad * 1.2)
+                sy = random.gauss(ccy, rad * 1.2)
+                if (sx - cx) ** 2 + (sy - cy) ** 2 <= radius_pt ** 2:
+                    dmin = min(math.hypot(sx - px, sy - py) for line2 in lines for px, py in line2)
+                    if dmin >= corridor_width_pt * 0.45:
+                        islands.append((sx, sy, rad))
+
+    # fill remaining islands randomly
+    remaining = N_islands - len(islands)
+    attempts = 0
+    while remaining > 0 and attempts < max(200, N_islands * 100):
+        attempts += 1
+        angle = random.uniform(0, 2 * math.pi)
+        r = radius_pt * math.sqrt(random.random())
+        sx = cx + r * math.cos(angle)
+        sy = cy + r * math.sin(angle)
+        dmin = min(math.hypot(sx - px, sy - py) for line in lines for px, py in line)
+        if dmin < corridor_width_pt * 0.5:
+            continue
+        rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
+        rad = max(0.5 * mm_to_pt, (avg_island_size_mm * mm_to_pt * 0.5) * rvar)
+        islands.append((sx, sy, rad))
+        remaining -= 1
+
+    # Draw islands as irregular polygons on canvas (points) until the actual raster coverage matches target.
+    coverage_img = Image.new("L", (int(2 * radius_pt + 2), int(2 * radius_pt + 2)), 255)
+    coverage_draw = ImageDraw.Draw(coverage_img)
+    coverage_mask = Image.new("L", coverage_img.size, 0)
+    mask_draw = ImageDraw.Draw(coverage_mask)
+    mask_draw.ellipse((0, 0, coverage_img.size[0] - 1, coverage_img.size[1] - 1), fill=255)
+    mask_pixels = sum(1 for p in coverage_mask.getdata() if p > 0)
+    offset_x = cx - radius_pt
+    offset_y = cy - radius_pt
+
+    for sx, sy, rad in islands:
+        n_points = 28
+        num_harmonics = 4
+        amplitudes = [random.uniform(0.15, 0.4) for _ in range(num_harmonics)]
+        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
+        pts = []
+        for i in range(n_points):
+            angle = (2 * math.pi * i) / n_points
+            r_variation = 0.0
+            for h in range(num_harmonics):
+                freq = h + 1
+                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
+            r_variation /= num_harmonics
+            r_local = rad * (1.0 + 0.6 * r_variation)
+            x = sx + r_local * math.cos(angle)
+            y = sy + r_local * math.sin(angle)
+            pts.append((x, y))
+        p = c.beginPath()
+        p.moveTo(pts[0][0], pts[0][1])
+        for x, y in pts[1:]:
+            p.lineTo(x, y)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
+        local_pts = [(x - offset_x, y - offset_y) for x, y in pts]
+        coverage_draw.polygon(local_pts, fill=0, outline=0)
+        black_pixels = sum(1 for mask_val, cov_val in zip(coverage_mask.getdata(), coverage_img.getdata())
+                          if mask_val > 0 and cov_val == 0)
+        if black_pixels / max(1, mask_pixels) >= inner_coverage:
+            break
+
 # ========== GUI ==========
 class PatternCreatorApp:
     def __init__(self, root):
@@ -886,6 +1226,7 @@ class PatternCreatorApp:
         self.var_pzz_num_corridors = tk.IntVar(value=3)
         self.var_pzz_num_islands = tk.IntVar(value=30)
         self.var_pzz_seed = tk.IntVar(value=0)
+        self.var_pzz_show_centers = tk.BooleanVar(value=False)
         
         # Compact parameters
         self.var_irregularity = tk.DoubleVar(value=0.5)
@@ -1195,6 +1536,10 @@ class PatternCreatorApp:
                             callback=self.on_preview)
             self._add_entry(self.params_frame, 9, "Random seed (0=rand):", self.var_pzz_seed, "",
                             callback=self.on_preview)
+            # Show corridor overlay for debugging in preview
+            chk = ttk.Checkbutton(self.params_frame, text="Show corridor overlay (preview)",
+                                  variable=self.var_pzz_show_centers, command=self.on_preview)
+            chk.grid(row=10, column=0, columnspan=2, sticky="w", pady=4)
         
         elif pattern_type == "Compact":
             self._add_slider(self.params_frame, 0, "Irregularity:", self.var_irregularity, 0.0, 1.0, "",
@@ -1436,6 +1781,18 @@ class PatternCreatorApp:
         elif self.var_pattern_type.get() == "Patchy":
             params["num_islands"] = int(self.var_num_islands.get())
             params["density"] = self.var_density.get()
+        elif self.var_pattern_type.get() == "Patchy Zig-Zag":
+            params["pzz_avg_island_size_mm"] = self.var_pzz_avg_island_size.get()
+            params["pzz_island_var"] = self.var_pzz_island_var.get()
+            params["pzz_num_islands"] = int(self.var_pzz_num_islands.get())
+            params["pzz_island_density"] = self.var_pzz_island_density.get()
+            params["pzz_clustering"] = self.var_pzz_clustering.get()
+            params["pzz_corridor_width_mm"] = self.var_pzz_corridor_width.get()
+            params["pzz_zigzag_amplitude_mm"] = self.var_pzz_zigzag_amplitude.get()
+            params["pzz_zigzag_frequency"] = self.var_pzz_zigzag_frequency.get()
+            params["pzz_num_corridors"] = int(self.var_pzz_num_corridors.get())
+            params["pzz_seed"] = int(self.var_pzz_seed.get())
+            params["pzz_show_centers"] = self.var_pzz_show_centers.get()
         elif self.var_pattern_type.get() == "Compact":
             params["irregularity"] = self.var_irregularity.get()
             params["offset_x_mm"] = self.var_offset_x.get()
@@ -1980,6 +2337,27 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
         
         add_patchy_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
                           None, num_islands, density)
+
+    elif pattern_type == "Patchy Zig-Zag":
+        # collect parameters
+        pzz_avg_island_size_mm = kwargs.get("pzz_avg_island_size_mm", 0.5)
+        pzz_island_var = kwargs.get("pzz_island_var", 0.4)
+        pzz_num_islands = kwargs.get("pzz_num_islands", 30)
+        pzz_island_density = kwargs.get("pzz_island_density", 1.0)
+        pzz_clustering = kwargs.get("pzz_clustering", 0.8)
+        pzz_corridor_width_mm = kwargs.get("pzz_corridor_width_mm", 0.6)
+        pzz_zigzag_amplitude_mm = kwargs.get("pzz_zigzag_amplitude_mm", 1.5)
+        pzz_zigzag_frequency = kwargs.get("pzz_zigzag_frequency", 4.0)
+        pzz_num_corridors = kwargs.get("pzz_num_corridors", 3)
+        pzz_seed = kwargs.get("pzz_seed", 0) or None
+        pzz_show_centers = kwargs.get("pzz_show_centers", False)
+
+        add_patchy_zigzag_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
+                                  circle_diameter_mm,
+                                  pzz_avg_island_size_mm, pzz_island_var, pzz_num_islands,
+                                  pzz_island_density, pzz_clustering, pzz_corridor_width_mm,
+                                  pzz_zigzag_amplitude_mm, pzz_zigzag_frequency, pzz_num_corridors, pzz_seed,
+                                  show_centers=pzz_show_centers)
     
     elif pattern_type == "Compact":
         irregularity = kwargs.get("irregularity", 0.5)
@@ -2109,6 +2487,24 @@ def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white
         
         add_patchy(c, cx, cy, pattern_radius_pt, inner_coverage,
                   None, num_islands, density)
+
+    elif pattern_type == "Patchy Zig-Zag":
+        pzz_avg_island_size_mm = kwargs.get("pzz_avg_island_size_mm", 0.5)
+        pzz_island_var = kwargs.get("pzz_island_var", 0.4)
+        pzz_num_islands = kwargs.get("pzz_num_islands", 30)
+        pzz_island_density = kwargs.get("pzz_island_density", 1.0)
+        pzz_clustering = kwargs.get("pzz_clustering", 0.8)
+        pzz_corridor_width_mm = kwargs.get("pzz_corridor_width_mm", 0.6)
+        pzz_zigzag_amplitude_mm = kwargs.get("pzz_zigzag_amplitude_mm", 1.5)
+        pzz_zigzag_frequency = kwargs.get("pzz_zigzag_frequency", 4.0)
+        pzz_num_corridors = kwargs.get("pzz_num_corridors", 3)
+        pzz_seed = kwargs.get("pzz_seed", 0) or None
+
+        add_patchy_zigzag(c, cx, cy, pattern_radius_pt, inner_coverage,
+                         circle_diameter_mm,
+                         pzz_avg_island_size_mm, pzz_island_var, pzz_num_islands,
+                         pzz_island_density, pzz_clustering, pzz_corridor_width_mm,
+                         pzz_zigzag_amplitude_mm, pzz_zigzag_frequency, pzz_num_corridors, pzz_seed)
     
     elif pattern_type == "Compact":
         irregularity = kwargs.get("irregularity", 0.5)

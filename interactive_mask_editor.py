@@ -35,6 +35,7 @@ class MaskEditor:
         self.pattern_offset_y = 0.0
         self.pattern_scale = 1.0  # Pattern zoom/scale factor
         self.pattern_rotation = 0.0  # Rotation in degrees
+        self.pattern_flip_horizontal = False  # Mirror/flip the pattern horizontally
         self.px_per_mm_x = 1.0  # Calibration: pixels per mm (width)
         self.px_per_mm_y = 1.0  # Calibration: pixels per mm (height)
         
@@ -90,6 +91,8 @@ class MaskEditor:
                  bg="lightgreen").pack(side=tk.LEFT, padx=2)
         tk.Button(toolbar, text="Remove Mode", command=lambda: self.set_mode("remove"),
                  bg="lightcoral").pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="Flip Pattern", command=self.toggle_flip,
+                 bg="lightblue").pack(side=tk.LEFT, padx=2)
         
         # Main content area
         content = tk.Frame(self.root)
@@ -235,6 +238,7 @@ STEP 6: Save
             self.pattern_offset_y = 0.0
             self.pattern_scale = 1.0
             self.pattern_rotation = 0.0
+            self.pattern_flip_horizontal = False
             self.pattern_scale_widget.set(1.0)
             self.pattern_rotation_widget.set(0)
             
@@ -264,6 +268,20 @@ STEP 6: Save
     def on_pattern_rotation_change(self, value):
         """Pattern rotation changed"""
         self.pattern_rotation = float(value)
+        self.update_display()
+    
+    def toggle_flip(self):
+        """Toggle horizontal flip of the pattern"""
+        if self.pattern_mask is None:
+            messagebox.showwarning("Warning", "No pattern loaded")
+            return
+        
+        self.pattern_flip_horizontal = not self.pattern_flip_horizontal
+        flip_status = "ON" if self.pattern_flip_horizontal else "OFF"
+        self.status_label.config(text=f"Pattern flip: {flip_status}")
+        
+        # Reset working mask to apply transform
+        self.working_mask = None
         self.update_display()
     
     def show_calibration(self):
@@ -407,21 +425,27 @@ STEP 6: Save
         else:
             pattern_scaled = self.pattern_mask.copy()
         
-        # Step 2: Apply rotation if needed
+        # Step 2: Apply flip if needed
+        if self.pattern_flip_horizontal:
+            pattern_flipped = cv2.flip(pattern_scaled.astype(np.uint8), 1) > 0.5  # 1 = flip horizontally
+        else:
+            pattern_flipped = pattern_scaled
+        
+        # Step 3: Apply rotation if needed
         if abs(self.pattern_rotation) > 0.1:
-            rows, cols = pattern_scaled.shape
+            rows, cols = pattern_flipped.shape
             center_y, center_x = rows / 2.0, cols / 2.0
             
             # getRotationMatrix2D expects (center_x, center_y) but it's (x, y) = (col, row)
             rotation_matrix = cv2.getRotationMatrix2D((center_x, center_y), self.pattern_rotation, 1.0)
             
-            pattern_rotated = cv2.warpAffine(pattern_scaled.astype(np.uint8), rotation_matrix, 
+            pattern_rotated = cv2.warpAffine(pattern_flipped.astype(np.uint8), rotation_matrix, 
                                             (cols, rows), borderValue=0, flags=cv2.INTER_LINEAR)
             pattern_rotated = pattern_rotated > 0.5
         else:
-            pattern_rotated = pattern_scaled
+            pattern_rotated = pattern_flipped
         
-        # Step 3: Create output mask and place pattern with offset
+        # Step 4: Create output mask and place pattern with offset
         output_mask = np.zeros((h, w), dtype=bool)
         
         ph, pw = pattern_rotated.shape
@@ -561,7 +585,8 @@ STEP 6: Save
         # Show offset and scale info if moving pattern
         info_text = ""
         if self.mode == "move":
-            info_text = f" | Pos: ({self.pattern_offset_x:.1f}, {self.pattern_offset_y:.1f}) | Scale: {self.pattern_scale:.2f}x | Rot: {self.pattern_rotation:.0f}°"
+            flip_indicator = " | Flipped" if self.pattern_flip_horizontal else ""
+            info_text = f" | Pos: ({self.pattern_offset_x:.1f}, {self.pattern_offset_y:.1f}) | Scale: {self.pattern_scale:.2f}x | Rot: {self.pattern_rotation:.0f}°{flip_indicator}"
         
         self.ax.set_title(f"Frame {self.frame_idx}/{self.video.shape[0]-1} | "
                          f"Brush: {self.brush_radius}px | Mode: {self.mode.upper()}{info_text}")
@@ -598,14 +623,17 @@ STEP 6: Save
             
             tifffile.imwrite(output_path, mask_save)
             
+            flip_status = "Yes" if self.pattern_flip_horizontal else "No"
             self.status_label.config(text=f"✓ Mask saved:\n{output_path}\n"
                                         f"Pos: ({self.pattern_offset_x:.1f}, {self.pattern_offset_y:.1f})\n"
-                                        f"Scale: {self.pattern_scale:.2f}x | Rot: {self.pattern_rotation:.0f}°")
+                                        f"Scale: {self.pattern_scale:.2f}x | Rot: {self.pattern_rotation:.0f}° | Flipped: {flip_status}")
+            flip_status = "Yes" if self.pattern_flip_horizontal else "No"
             messagebox.showinfo("Success", f"Mask saved!\n\n"
                                          f"Path: {output_path}\n"
                                          f"Position: ({self.pattern_offset_x:.1f}, {self.pattern_offset_y:.1f})\n"
                                          f"Scale: {self.pattern_scale:.2f}x\n"
-                                         f"Rotation: {self.pattern_rotation:.0f}°")
+                                         f"Rotation: {self.pattern_rotation:.0f}°\n"
+                                         f"Flipped: {flip_status}")
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save mask: {str(e)}")
