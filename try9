@@ -874,161 +874,58 @@ def add_patchy_zigzag_preview(draw, cx, cy, radius_px, inner_coverage,
                               zigzag_frequency, num_corridors, seed=None, show_centers=False):
     """Preview for Patchy Zig-Zag pattern.
 
-    Strategy:
-    - Generate continuous zig-zag corridor centerlines with extra small-scale jitter to increase tortuosity.
-    - Reserve corridor bands (no islands placed inside them).
-    - Create clusters of islands along corridor edges and fill remaining islands elsewhere.
-    - Draw irregular island polygons similar to `add_patchy_preview`.
-    - Optionally draw corridor centerlines for debugging.
+    Draws the exact same island polygons that `_generate_patchy_zigzag_polygons`
+    produces for the PDF, so the on-screen preview and the generated PDF match.
     """
     if inner_coverage <= 0 or num_islands <= 0:
         return
 
-    if seed:
-        random.seed(seed)
+    for points in _generate_patchy_zigzag_polygons(
+            cx, cy, radius_px, inner_coverage, circle_diameter_mm,
+            avg_island_size_mm, island_var, num_islands,
+            island_density, clustering, corridor_width_mm,
+            zigzag_amplitude_mm, zigzag_frequency, num_corridors, seed):
+        draw.polygon(points, fill=0, outline=0)
 
-    # convert mm->px scale based on display circle diameter
-    mm_to_px = (2.0 * radius_px) / max(1e-9, circle_diameter_mm)
-    corridor_width_px = max(1.0, corridor_width_mm * mm_to_px)
-    amplitude_px = zigzag_amplitude_mm * mm_to_px
+    # Optionally draw corridor centerlines for visualization (thin)
+    if show_centers:
+        if seed is not None:
+            random.seed(seed)
+        ref = _ZZ_REF
+        mm_to_unit = (2.0 * ref) / max(1e-9, circle_diameter_mm)
+        amplitude = zigzag_amplitude_mm * mm_to_unit
+        lines = _build_zigzag_lines(0.0, 0.0, ref, num_corridors, amplitude,
+                                    zigzag_frequency, circle_diameter_mm)
+        out_scale = radius_px / ref
+        corridor_width_px = max(1.0, corridor_width_mm * (2.0 * radius_px) / max(1e-9, circle_diameter_mm))
+        line_width = max(1, int(corridor_width_px * 0.12))
+        for line in lines:
+            pts = [(cx + x * out_scale, cy + y * out_scale) for x, y in line]
+            draw.line(pts, fill=128, width=line_width)
 
-    # Build centerlines with extra jitter for tortuosity
-    # increase samples for smoother, more tortuous paths
-    base_lines = _generate_zigzag_centerlines(cx, cy, radius_px, num_corridors, amplitude_px, zigzag_frequency, circle_diameter_mm)
+
+
+_ZZ_REF = 500.0  # fixed reference radius for scale-invariant zig-zag generation
+
+
+def _build_zigzag_lines(cx, cy, radius, num_corridors, amplitude,
+                        zigzag_frequency, circle_diameter_mm):
+    """Build jittered zig-zag corridor centerlines.
+
+    Consumes the current random state (the caller is responsible for seeding).
+    """
+    base_lines = _generate_zigzag_centerlines(cx, cy, radius, num_corridors,
+                                              amplitude, zigzag_frequency, circle_diameter_mm)
     lines = []
-    for i, base in enumerate(base_lines):
+    jitter_scale = max(1.0, amplitude * 0.12)
+    for base in base_lines:
         jittered = []
-        jitter_scale = max(1.0, amplitude_px * 0.12)
-        for (x, y) in base:
-            # add small per-point jitter (deterministic under seed)
+        for x, y in base:
             jx = x + random.uniform(-jitter_scale, jitter_scale)
             jy = y + random.uniform(-jitter_scale * 0.2, jitter_scale * 0.2)
             jittered.append((jx, jy))
         lines.append(jittered)
-
-    # target black area
-    circle_area = math.pi * radius_px * radius_px
-    target_area = inner_coverage * circle_area
-
-    # island parameters
-    avg_island_d_px = max(1.0, avg_island_size_mm * mm_to_px)
-    avg_island_area_px = max(1.0, math.pi * (avg_island_d_px * 0.5) ** 2 * 0.7)
-    # derive a coverage-driven island count so the requested black fraction is reached
-    N_islands = max(int(max(1, num_islands)),
-                    int(math.ceil(target_area * max(0.25, island_density) * 1.2 / max(1.0, avg_island_area_px))))
-
-    accumulated = 0.0
-
-    islands = []  # list of (cx,cy,radius_px)
-
-    # First, create clustered islands along corridor edges
-    cluster_fraction = max(0.0, min(1.0, clustering))
-    # more aggressive clustering when clustering is high
-    clusters_per_corridor = max(4, int(max(4, N_islands * cluster_fraction / max(1, num_corridors))))
-    islands_per_cluster = max(1, int(max(1, (N_islands * cluster_fraction) // max(1, clusters_per_corridor * num_corridors))))
-
-    # Precompute flattened centerline points for quick distance checks
-    center_pts = [(px, py) for line in lines for (px, py) in line]
-
-    for i, line in enumerate(lines):
-        # choose cluster positions along the line
-        L = len(line)
-        for cidx in range(clusters_per_corridor):
-            tpos = int(((cidx + 0.5) / clusters_per_corridor) * (L - 1))
-            lx, ly = line[tpos]
-            # approximate local normal
-            p0 = line[max(0, tpos - 2)]
-            p1 = line[min(L - 1, tpos + 2)]
-            dx = p1[0] - p0[0]
-            dy = p1[1] - p0[1]
-            nx = -dy
-            nyv = dx
-            norm = math.hypot(nx, nyv) + 1e-9
-            nx /= norm
-            nyv /= norm
-
-            # alternate side and vary offset to create tortuous corridor edges
-            side = -1 if (cidx % 2 == 0) else 1
-            edge_offset = corridor_width_px * 0.5 + avg_island_d_px * 0.6
-            variable_offset = edge_offset * (0.8 + 0.4 * random.random())
-            ccx = lx + nx * (variable_offset * side)
-            ccy = ly + nyv * (variable_offset * side)
-
-            # generate islands around cluster center
-            for j in range(islands_per_cluster):
-                rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
-                rad = max(1.0, (avg_island_d_px * 0.5) * rvar)
-                # small gaussian spread, biased towards corridor edge
-                sx = random.gauss(ccx, rad * 0.9) + nx * random.uniform(-rad, rad) * 0.3
-                sy = random.gauss(ccy, rad * 0.9) + nyv * random.uniform(-rad, rad) * 0.3
-                # accept if inside circle and not inside corridor band
-                if (sx - cx) ** 2 + (sy - cy) ** 2 <= radius_px ** 2:
-                    # distance to nearest centerline (use precomputed pts)
-                    dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
-                    if dmin >= corridor_width_px * 0.45:
-                        islands.append((sx, sy, rad))
-
-    # Fill remaining islands randomly outside corridors
-    remaining = N_islands - len(islands)
-    attempts = 0
-    while remaining > 0 and attempts < max(200, N_islands * 100):
-        attempts += 1
-        t = random.random()
-        r_factor = math.sqrt(t)
-        ang = random.uniform(0, 2 * math.pi)
-        sx = cx + r_factor * radius_px * math.cos(ang)
-        sy = cy + r_factor * radius_px * math.sin(ang)
-        # ensure outside corridor band (leave corridor_width_px/2 clear)
-        dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
-        if dmin < corridor_width_px * 0.5:
-            continue
-        rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
-        rad = max(1.0, (avg_island_d_px * 0.5) * rvar)
-        islands.append((sx, sy, rad))
-        remaining -= 1
-
-    # Draw islands until the actual circular coverage reaches the target.
-    coverage_img = Image.new("L", (int(2 * radius_px + 2), int(2 * radius_px + 2)), 255)
-    coverage_draw = ImageDraw.Draw(coverage_img)
-    coverage_mask = Image.new("L", coverage_img.size, 0)
-    mask_draw = ImageDraw.Draw(coverage_mask)
-    mask_draw.ellipse((0, 0, coverage_img.size[0] - 1, coverage_img.size[1] - 1), fill=255)
-    mask_pixels = sum(1 for p in coverage_mask.getdata() if p > 0)
-    offset_x = cx - radius_px
-    offset_y = cy - radius_px
-
-    for sx, sy, rad in islands:
-        # build irregular polygon as in add_patchy_preview
-        n_points = 28
-        points = []
-        num_harmonics = 4
-        amplitudes = [random.uniform(0.15, 0.45) for _ in range(num_harmonics)]
-        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
-        for i in range(n_points):
-            angle = (2 * math.pi * i) / n_points
-            r_variation = 0.0
-            for h in range(num_harmonics):
-                freq = h + 1
-                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
-            r_variation /= num_harmonics
-            r_local = rad * (1.0 + 0.7 * r_variation)
-            x = sx + r_local * math.cos(angle)
-            y = sy + r_local * math.sin(angle)
-            points.append((x, y))
-        local_points = [(x - offset_x, y - offset_y) for x, y in points]
-        coverage_draw.polygon(local_points, fill=0, outline=0)
-        draw.polygon(points, fill=0, outline=0)
-        black_pixels = sum(1 for mask_val, cov_val in zip(coverage_mask.getdata(), coverage_img.getdata())
-                          if mask_val > 0 and cov_val == 0)
-        if black_pixels / max(1, mask_pixels) >= inner_coverage:
-            break
-
-    # Optionally draw corridor centerlines for visualization (thin)
-    if show_centers:
-        line_width = max(1, int(corridor_width_px * 0.12))
-        for line in lines:
-            # darker gray for visibility on preview
-            draw.line(line, fill=128, width=line_width)
+    return lines
 
 
 def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
@@ -1042,23 +939,21 @@ def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
     if seed is not None:
         random.seed(seed)
 
-    mm_to_unit = (2.0 * radius) / max(1e-9, circle_diameter_mm)
+    # Generate all geometry at a fixed reference scale so the output is a pure
+    # scaled/translated copy regardless of the requested drawing radius. This is what
+    # keeps the preview (pixels) and the PDF (points) in exact agreement: several helpers
+    # use absolute floors (max(1.0, ...)) and sample counts that would otherwise behave
+    # differently at the tiny PDF-point scale versus the large preview-pixel scale.
+    ref = _ZZ_REF
+    rcx = rcy = 0.0
+    mm_to_unit = (2.0 * ref) / max(1e-9, circle_diameter_mm)
     corridor_width = max(1.0, corridor_width_mm * mm_to_unit)
     amplitude = zigzag_amplitude_mm * mm_to_unit
 
-    base_lines = _generate_zigzag_centerlines(cx, cy, radius, num_corridors,
-                                              amplitude, zigzag_frequency, circle_diameter_mm)
-    lines = []
-    jitter_scale = max(1.0, amplitude * 0.12)
-    for base in base_lines:
-        jittered = []
-        for x, y in base:
-            jx = x + random.uniform(-jitter_scale, jitter_scale)
-            jy = y + random.uniform(-jitter_scale * 0.2, jitter_scale * 0.2)
-            jittered.append((jx, jy))
-        lines.append(jittered)
+    lines = _build_zigzag_lines(rcx, rcy, ref, num_corridors, amplitude,
+                                zigzag_frequency, circle_diameter_mm)
 
-    circle_area = math.pi * radius * radius
+    circle_area = math.pi * ref * ref
     target_area = inner_coverage * circle_area
 
     avg_island_d = max(1.0, avg_island_size_mm * mm_to_unit)
@@ -1099,7 +994,7 @@ def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
                 rad = max(1.0, (avg_island_d * 0.5) * rvar)
                 sx = random.gauss(ccx, rad * 0.9) + nx * random.uniform(-rad, rad) * 0.3
                 sy = random.gauss(ccy, rad * 0.9) + ny * random.uniform(-rad, rad) * 0.3
-                if (sx - cx) ** 2 + (sy - cy) ** 2 <= radius * radius:
+                if (sx - rcx) ** 2 + (sy - rcy) ** 2 <= ref * ref:
                     dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
                     if dmin >= corridor_width * 0.45:
                         islands.append((sx, sy, rad))
@@ -1111,8 +1006,8 @@ def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
         t = random.random()
         r_factor = math.sqrt(t)
         ang = random.uniform(0, 2 * math.pi)
-        sx = cx + r_factor * radius * math.cos(ang)
-        sy = cy + r_factor * radius * math.sin(ang)
+        sx = rcx + r_factor * ref * math.cos(ang)
+        sy = rcy + r_factor * ref * math.sin(ang)
         dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
         if dmin < corridor_width * 0.5:
             continue
@@ -1121,14 +1016,20 @@ def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
         islands.append((sx, sy, rad))
         remaining -= 1
 
-    coverage_img = Image.new("L", (int(2 * radius + 2), int(2 * radius + 2)), 255)
+    # Measure coverage on a fixed-resolution grid at the reference scale.
+    meas_size = 512
+    meas_scale = meas_size / (2.0 * ref)
+    coverage_img = Image.new("L", (meas_size, meas_size), 255)
     coverage_draw = ImageDraw.Draw(coverage_img)
     coverage_mask = Image.new("L", coverage_img.size, 0)
     mask_draw = ImageDraw.Draw(coverage_mask)
     mask_draw.ellipse((0, 0, coverage_img.size[0] - 1, coverage_img.size[1] - 1), fill=255)
     mask_pixels = sum(1 for p in coverage_mask.getdata() if p > 0)
-    offset_x = cx - radius
-    offset_y = cy - radius
+    offset_x = rcx - ref
+    offset_y = rcy - ref
+
+    # Map from the reference space to the requested (cx, cy, radius).
+    out_scale = radius / ref
 
     for sx, sy, rad in islands:
         n_points = 28
@@ -1147,10 +1048,11 @@ def _generate_patchy_zigzag_polygons(cx, cy, radius, inner_coverage,
             x = sx + r_local * math.cos(angle)
             y = sy + r_local * math.sin(angle)
             points.append((x, y))
-        coverage_draw.polygon([(x - offset_x, y - offset_y) for x, y in points], fill=0, outline=0)
+        coverage_draw.polygon([((x - offset_x) * meas_scale, (y - offset_y) * meas_scale)
+                               for x, y in points], fill=0, outline=0)
         black_pixels = sum(1 for mask_val, cov_val in zip(coverage_mask.getdata(), coverage_img.getdata())
                           if mask_val > 0 and cov_val == 0)
-        yield points
+        yield [(cx + (x - rcx) * out_scale, cy + (y - rcy) * out_scale) for x, y in points]
         if black_pixels / max(1, mask_pixels) >= inner_coverage:
             return
 
@@ -1173,147 +1075,12 @@ def add_patchy_zigzag(c, cx, cy, radius_pt, inner_coverage,
         island_density, clustering, corridor_width_mm,
         zigzag_amplitude_mm, zigzag_frequency, num_corridors, seed):
         p = c.beginPath()
-        p.moveTo(points[0][0], points[0][1])
+        p.moveTo(points[0][0], 2.0 * cy - points[0][1])
         for x, y in points[1:]:
-            p.lineTo(x, y)
+            p.lineTo(x, 2.0 * cy - y)
         p.close()
         c.drawPath(p, stroke=0, fill=1)
 
-# ========== GUI ==========
-    """Draw Patchy Zig-Zag pattern into PDF canvas (points units = pt/mm via mm conversion)."""
-    if inner_coverage <= 0 or num_islands <= 0:
-        return
-
-    if seed:
-        random.seed(seed)
-
-    # Ensure black fill for PDFs; prior operations may have left white as the current fill.
-    c.setFillColor(colors.black)
-
-    # convert mm->pt: 1 mm == mm (points multiplier is already included by caller using mm*mm)
-    # Here radius_pt is in points; circle_diameter_mm known
-    mm_to_pt = (2.0 * radius_pt) / max(1e-9, circle_diameter_mm)
-    corridor_width_pt = max(0.5, corridor_width_mm * mm_to_pt)
-    amplitude_pt = zigzag_amplitude_mm * mm_to_pt
-
-    # Build corridor centerlines using the shared zig-zag generator.
-    base_lines = _generate_zigzag_centerlines(cx, cy, radius_pt, num_corridors,
-                                              amplitude_pt, zigzag_frequency, circle_diameter_mm)
-    lines = []
-    jitter_scale = max(1.0, amplitude_pt * 0.12)
-    for base in base_lines:
-        jittered = []
-        for (x, y) in base:
-            jx = x + random.uniform(-jitter_scale, jitter_scale)
-            jy = y + random.uniform(-jitter_scale * 0.2, jitter_scale * 0.2)
-            jittered.append((jx, jy))
-        lines.append(jittered)
-
-    # target area
-    circle_area = math.pi * radius_pt * radius_pt
-    target_area = inner_coverage * circle_area
-
-    islands = []
-    avg_island_d_pt = max(1.0, avg_island_size_mm * mm_to_pt)
-    avg_island_area_pt = max(1.0, math.pi * (avg_island_d_pt * 0.5) ** 2 * 0.7)
-    N_islands = max(int(max(1, num_islands)),
-                    int(math.ceil(target_area * max(0.25, island_density) * 1.2 / max(1.0, avg_island_area_pt))))
-
-    # clustered islands along corridor edges
-    cluster_fraction = max(0.0, min(1.0, clustering))
-    clusters_per_corridor = max(4, int(max(4, N_islands * cluster_fraction / max(1, num_corridors))))
-    islands_per_cluster = max(1, int(max(1, (N_islands * cluster_fraction) // max(1, clusters_per_corridor * num_corridors))))
-
-    center_pts = [(px, py) for line in lines for (px, py) in line]
-
-    for i, line in enumerate(lines):
-        L = len(line)
-        for cidx in range(clusters_per_corridor):
-            tpos = int(((cidx + 0.5) / clusters_per_corridor) * (L - 1))
-            lx, ly = line[tpos]
-            p0 = line[max(0, tpos - 2)]
-            p1 = line[min(L - 1, tpos + 2)]
-            dx = p1[0] - p0[0]
-            dy = p1[1] - p0[1]
-            nx = -dy
-            nyv = dx
-            norm = math.hypot(nx, nyv) + 1e-9
-            nx /= norm
-            nyv /= norm
-
-            side = -1 if (cidx % 2 == 0) else 1
-            edge_offset = corridor_width_pt * 0.5 + avg_island_d_pt * 0.6
-            variable_offset = edge_offset * (0.8 + 0.4 * random.random())
-            ccx = lx + nx * (variable_offset * side)
-            ccy = ly + nyv * (variable_offset * side)
-
-            for j in range(islands_per_cluster):
-                rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
-                rad = max(1.0, (avg_island_d_pt * 0.5) * rvar)
-                sx = random.gauss(ccx, rad * 0.9) + nx * random.uniform(-rad, rad) * 0.3
-                sy = random.gauss(ccy, rad * 0.9) + nyv * random.uniform(-rad, rad) * 0.3
-                if (sx - cx) ** 2 + (sy - cy) ** 2 <= radius_pt ** 2:
-                    dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
-                    if dmin >= corridor_width_pt * 0.45:
-                        islands.append((sx, sy, rad))
-
-    # Fill remaining islands randomly outside corridors
-    remaining = N_islands - len(islands)
-    attempts = 0
-    while remaining > 0 and attempts < max(200, N_islands * 100):
-        attempts += 1
-        t = random.random()
-        r = radius_pt * math.sqrt(t)
-        angle = random.uniform(0, 2 * math.pi)
-        sx = cx + r * math.cos(angle)
-        sy = cy + r * math.sin(angle)
-        dmin = min(math.hypot(sx - px, sy - py) for px, py in center_pts)
-        if dmin < corridor_width_pt * 0.5:
-            continue
-        rvar = random.uniform(1.0 - island_var, 1.0 + island_var)
-        rad = max(1.0, (avg_island_d_pt * 0.5) * rvar)
-        islands.append((sx, sy, rad))
-        remaining -= 1
-
-    # Draw islands as irregular polygons on canvas (points) until the actual raster coverage matches target.
-    coverage_img = Image.new("L", (int(2 * radius_pt + 2), int(2 * radius_pt + 2)), 255)
-    coverage_draw = ImageDraw.Draw(coverage_img)
-    coverage_mask = Image.new("L", coverage_img.size, 0)
-    mask_draw = ImageDraw.Draw(coverage_mask)
-    mask_draw.ellipse((0, 0, coverage_img.size[0] - 1, coverage_img.size[1] - 1), fill=255)
-    mask_pixels = sum(1 for p in coverage_mask.getdata() if p > 0)
-    offset_x = cx - radius_pt
-    offset_y = cy - radius_pt
-
-    for sx, sy, rad in islands:
-        n_points = 28
-        num_harmonics = 4
-        amplitudes = [random.uniform(0.15, 0.45) for _ in range(num_harmonics)]
-        phases = [random.uniform(0, 2 * math.pi) for _ in range(num_harmonics)]
-        pts = []
-        for i in range(n_points):
-            angle = (2 * math.pi * i) / n_points
-            r_variation = 0.0
-            for h in range(num_harmonics):
-                freq = h + 1
-                r_variation += amplitudes[h] * math.sin(freq * angle + phases[h])
-            r_variation /= num_harmonics
-            r_local = rad * (1.0 + 0.7 * r_variation)
-            x = sx + r_local * math.cos(angle)
-            y = sy + r_local * math.sin(angle)
-            pts.append((x, y))
-        p = c.beginPath()
-        p.moveTo(pts[0][0], pts[0][1])
-        for x, y in pts[1:]:
-            p.lineTo(x, y)
-        p.close()
-        c.drawPath(p, stroke=0, fill=1)
-        local_pts = [(x - offset_x, y - offset_y) for x, y in pts]
-        coverage_draw.polygon(local_pts, fill=0, outline=0)
-        black_pixels = sum(1 for mask_val, cov_val in zip(coverage_mask.getdata(), coverage_img.getdata())
-                          if mask_val > 0 and cov_val == 0)
-        if black_pixels / max(1, mask_pixels) >= inner_coverage:
-            break
 
 # ========== GUI ==========
 class PatternCreatorApp:
