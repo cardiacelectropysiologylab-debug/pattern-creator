@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageTk, ImageChops
 import math
 import random
 import os
@@ -18,6 +18,166 @@ MATTEK_SIZES = {
     "24-well plate": 2.6,
     "96-well plate": 0.8,                                                                                                                      
 }
+
+# Pattern placement options: restrict the fibrosis pattern to a sub-region of the
+# circle while leaving the rest completely white. This is a spatial masking layer
+# applied on top of the existing pattern generators; it does not alter them.
+PLACEMENT_OPTIONS = [
+    "Full circle",
+    "Top-left quarter",
+    "Top-right quarter",
+    "Bottom-left quarter",
+    "Bottom-right quarter",
+    "Center - 25% area",
+]
+
+# Central placement circle has 25% of the full-circle area -> radius = 0.5 * R.
+_PLACEMENT_CENTER_RADIUS_FRACTION = 0.5
+
+
+def _placement_key(placement):
+    """Map a placement display string to an internal key."""
+    return {
+        "Full circle": "full",
+        "Top-left quarter": "top-left",
+        "Top-right quarter": "top-right",
+        "Bottom-left quarter": "bottom-left",
+        "Bottom-right quarter": "bottom-right",
+        "Center - 25% area": "center",
+    }.get(placement, "full")
+
+
+def _clamp_border(white_border_fraction):
+    return max(0.0, min(0.9, white_border_fraction))
+
+
+def _placement_region_area_fraction(placement):
+    """area(placement region) / area(full circle) for the geometric region."""
+    key = _placement_key(placement)
+    if key == "full":
+        return 1.0
+    if key == "center":
+        return _PLACEMENT_CENTER_RADIUS_FRACTION ** 2
+    return 0.25  # quarters
+
+
+def _placement_allowed_area_fraction(placement, white_border_fraction):
+    """area(placement region ∩ allowed disk) / area(full circle)."""
+    key = _placement_key(placement)
+    rp = 1.0 - _clamp_border(white_border_fraction)  # pattern_radius / outer_radius
+    rho = rp * rp
+    if key == "full":
+        return rho
+    if key == "center":
+        rc = _PLACEMENT_CENTER_RADIUS_FRACTION
+        return rc * rc if rp >= rc else rho
+    return rho * 0.25  # quarters
+
+
+def _placement_coverage_factor(placement, white_border_fraction):
+    """Fraction of the placement region that lies inside the allowed (post-border) area.
+
+    The coverage parameter refers to the fibrosis percentage *within the selected
+    placement region*. The generators fill the allowed pattern circle uniformly at a
+    target density; dividing the requested coverage by this factor yields that density
+    so the achieved coverage inside the placement region matches the requested value.
+    """
+    region = _placement_region_area_fraction(placement)
+    allowed = _placement_allowed_area_fraction(placement, white_border_fraction)
+    return allowed / region if region > 0 else 0.0
+
+
+def _remaining_coverage_factor(placement, white_border_fraction):
+    """Coverage factor for the remaining area outside the placement region.
+
+    Returns None when there is no remaining area (full-circle placement) or no
+    allowed remaining area, in which case secondary fibrosis is not applicable.
+    """
+    rp = 1.0 - _clamp_border(white_border_fraction)
+    rho = rp * rp
+    region_q = 1.0 - _placement_region_area_fraction(placement)
+    allowed_q = rho - _placement_allowed_area_fraction(placement, white_border_fraction)
+    if region_q <= 1e-9 or allowed_q <= 1e-9:
+        return None
+    return allowed_q / region_q
+
+
+def _placement_shape_mask(size, cx, cy, outer_radius_px, placement):
+    """255 inside the placement geometric region, else 0 (full circle -> all 255)."""
+    key = _placement_key(placement)
+    m = Image.new("L", size, 0)
+    d = ImageDraw.Draw(m)
+    w, h = size
+    if key == "full":
+        d.rectangle((0, 0, w, h), fill=255)
+    elif key == "center":
+        r = outer_radius_px * _PLACEMENT_CENTER_RADIUS_FRACTION
+        d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=255)
+    elif key == "top-left":
+        d.rectangle((0, 0, cx, cy), fill=255)
+    elif key == "top-right":
+        d.rectangle((cx, 0, w, cy), fill=255)
+    elif key == "bottom-left":
+        d.rectangle((0, cy, cx, h), fill=255)
+    elif key == "bottom-right":
+        d.rectangle((cx, cy, w, h), fill=255)
+    return m
+
+
+def _region_mask_preview(circle_mask, cx, cy, outer_radius_px, placement, remaining=False):
+    """Restrict a circular preview mask to the placement region or its complement."""
+    key = _placement_key(placement)
+    if key == "full" and not remaining:
+        return circle_mask
+    shape = _placement_shape_mask(circle_mask.size, cx, cy, outer_radius_px, placement)
+    if remaining:
+        shape = ImageChops.invert(shape)
+    return ImageChops.multiply(circle_mask, shape)
+
+
+def _apply_placement_clip_pdf(c, cx, cy, outer_radius_pt, placement, page_size):
+    """Intersect the current PDF clip with the selected placement region.
+
+    PDF coordinates are y-up, so 'top' corresponds to larger y (matching the preview,
+    whose image origin is top-left).
+    """
+    key = _placement_key(placement)
+    if key == "full":
+        return
+    p = c.beginPath()
+    if key == "center":
+        p.circle(cx, cy, outer_radius_pt * _PLACEMENT_CENTER_RADIUS_FRACTION)
+    elif key == "top-left":
+        p.rect(0, cy, cx, page_size - cy)
+    elif key == "top-right":
+        p.rect(cx, cy, page_size - cx, page_size - cy)
+    elif key == "bottom-left":
+        p.rect(0, 0, cx, cy)
+    elif key == "bottom-right":
+        p.rect(cx, 0, page_size - cx, cy)
+    c.clipPath(p, stroke=0, fill=0)
+
+
+def _fill_placement_shape_pdf(c, cx, cy, outer_radius_pt, placement, page_size):
+    """Fill the placement region with the current fill colour (used to erase).
+
+    Coordinates match _apply_placement_clip_pdf. No-op for full circle.
+    """
+    key = _placement_key(placement)
+    p = c.beginPath()
+    if key == "center":
+        p.circle(cx, cy, outer_radius_pt * _PLACEMENT_CENTER_RADIUS_FRACTION)
+    elif key == "top-left":
+        p.rect(0, cy, cx, page_size - cy)
+    elif key == "top-right":
+        p.rect(cx, cy, page_size - cx, page_size - cy)
+    elif key == "bottom-left":
+        p.rect(0, 0, cx, cy)
+    elif key == "bottom-right":
+        p.rect(cx, 0, page_size - cx, cy)
+    else:
+        return
+    c.drawPath(p, stroke=0, fill=1)
 
 def _rect_inside_circle_fraction(rx, ry, cx, cy, half_length, half_width, radius, samples=5):
     """Estimate fraction of rectangle that lies inside a circle via uniform sampling."""
@@ -1120,6 +1280,11 @@ class PatternCreatorApp:
         self.var_complete_to_10mm = tk.BooleanVar(value=False)
         self.var_coverage = tk.DoubleVar(value=20.0)
         self.var_white_border = tk.DoubleVar(value=15.0)
+        self.var_placement = tk.StringVar(value="Full circle")
+        # Secondary fibrosis in the remaining area (outside the placement region)
+        self.var_secondary_enabled = tk.BooleanVar(value=False)
+        self.var_secondary_coverage = tk.DoubleVar(value=5.0)
+        self.var_secondary_pattern_type = tk.StringVar(value="Same as main")
         
         # Interstitial parameters
         self.var_rect_length = tk.DoubleVar(value=500.0)  # µm
@@ -1233,7 +1398,7 @@ class PatternCreatorApp:
         # Coverage
         self._add_entry(controls, row, "Total coverage (%):", self.var_coverage, "%",
                    callback=self.on_preview)
-        ttk.Label(controls, text="  (of entire circle)", 
+        ttk.Label(controls, text="  (of selected pattern region)", 
                  font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         
@@ -1243,6 +1408,38 @@ class PatternCreatorApp:
         ttk.Label(controls, text="  (for electrical propagation)", 
                  font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
+        
+        # Pattern placement (spatial restriction of the fibrosis region)
+        ttk.Label(controls, text="Pattern placement:").grid(row=row, column=0, sticky="w")
+        placement_menu = ttk.Combobox(controls, textvariable=self.var_placement,
+                                      values=PLACEMENT_OPTIONS,
+                                      state="readonly", width=20)
+        placement_menu.grid(row=row, column=1, sticky="ew", pady=2)
+        placement_menu.bind("<<ComboboxSelected>>", self.on_preview)
+        row += 1
+        ttk.Label(controls, text="  (coverage applies within the selected region)", 
+                 font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        
+        # Secondary fibrosis in the remaining area (outside the placement region)
+        self.secondary_frame = ttk.LabelFrame(controls, text="Secondary fibrosis in remaining area", padding=5)
+        self.secondary_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        row += 1
+        sec = self.secondary_frame
+        sec.columnconfigure(1, weight=1)
+        ttk.Checkbutton(sec, text="Enable", variable=self.var_secondary_enabled,
+                        command=self.on_preview).grid(row=0, column=0, columnspan=2, sticky="w")
+        self._add_entry(sec, 1, "Secondary coverage (%):", self.var_secondary_coverage, "%",
+                        callback=self.on_preview)
+        ttk.Label(sec, text="  (of the remaining-area only)",
+                  font=("TkDefaultFont", 8, "italic")).grid(row=2, column=0, columnspan=2, sticky="w")
+        ttk.Label(sec, text="Secondary pattern type:").grid(row=3, column=0, sticky="w")
+        self.secondary_type_menu = ttk.Combobox(
+            sec, textvariable=self.var_secondary_pattern_type,
+            values=["Same as main", "Interstitial", "Diffuse", "Patchy", "Patchy Zig-Zag", "Compact"],
+            state="readonly", width=18)
+        self.secondary_type_menu.grid(row=3, column=1, sticky="ew", pady=2)
+        self.secondary_type_menu.bind("<<ComboboxSelected>>", self.on_preview)
         
         # Coverage info display
         self.coverage_info_frame = ttk.LabelFrame(controls, text="Coverage Information", padding=5)
@@ -1565,8 +1762,9 @@ class PatternCreatorApp:
         # Calculate inner coverage
         pattern_radius_fraction = 1.0 - white_border
         area_ratio = pattern_radius_fraction ** 2
-        if area_ratio > 0:
-            inner_coverage = min(99, (total_coverage / area_ratio) * 100)
+        cov_factor = _placement_coverage_factor(self.var_placement.get(), white_border)
+        if cov_factor > 0:
+            inner_coverage = min(99, (total_coverage / cov_factor) * 100)
         else:
             inner_coverage = 0
         self.inner_coverage_label.config(text=f"Inner pattern coverage: {inner_coverage:.1f}%")
@@ -1655,19 +1853,39 @@ class PatternCreatorApp:
         outer_r2 = outer_radius_px * outer_radius_px
         inner_r2 = inner_radius_px * inner_radius_px
 
+        placement_key = _placement_key(params.get("placement", "Full circle"))
+        center_r2 = (outer_radius_px * _PLACEMENT_CENTER_RADIUS_FRACTION) ** 2
+
         for y in range(ymin, ymax + 1):
             dy = y - cy
             for x in range(xmin, xmax + 1):
                 dx = x - cx
                 d2 = dx * dx + dy * dy
-                if d2 <= outer_r2:
-                    outer_count += 1
+                if d2 > outer_r2:
+                    continue
+                # Only count pixels inside the selected placement region
+                if placement_key == "center":
+                    if d2 > center_r2:
+                        continue
+                elif placement_key == "top-left":
+                    if not (dx <= 0 and dy <= 0):
+                        continue
+                elif placement_key == "top-right":
+                    if not (dx >= 0 and dy <= 0):
+                        continue
+                elif placement_key == "bottom-left":
+                    if not (dx <= 0 and dy >= 0):
+                        continue
+                elif placement_key == "bottom-right":
+                    if not (dx >= 0 and dy >= 0):
+                        continue
+                outer_count += 1
+                if pixels[x, y] < 128:
+                    outer_black += 1
+                if d2 <= inner_r2:
+                    inner_count += 1
                     if pixels[x, y] < 128:
-                        outer_black += 1
-                    if d2 <= inner_r2:
-                        inner_count += 1
-                        if pixels[x, y] < 128:
-                            inner_black += 1
+                        inner_black += 1
 
         achieved_total = (outer_black / outer_count) if outer_count > 0 else 0.0
         achieved_inner = (inner_black / inner_count) if inner_count > 0 else 0.0
@@ -1687,45 +1905,49 @@ class PatternCreatorApp:
             "circle_diameter_mm": diameter,
             "complete_to_10mm": self.var_complete_to_10mm.get(),
             "white_border_fraction": white_border,
+            "placement": self.var_placement.get(),
             "rect_length_mm": self.var_rect_length.get() / 1000.0,
             "rect_width_mm": self.var_rect_width.get() / 1000.0,
             "angle_deg": self.var_angle.get(),
         }
-        
-        if self.var_pattern_type.get() == "Interstitial":
-            params["spacing_along_mm"] = self.var_spacing_along.get() / 1000.0
-            params["spacing_across_mm"] = self.var_spacing_across.get() / 1000.0
-            params["indentation"] = self.var_indentation.get()
-        elif self.var_pattern_type.get() == "Diffuse":
-            params["randomness"] = self.var_randomness.get() / 100.0
-        elif self.var_pattern_type.get() == "Patchy":
-            params["num_islands"] = int(self.var_num_islands.get())
-            params["density"] = self.var_density.get()
-        elif self.var_pattern_type.get() == "Patchy Zig-Zag":
-            params["pzz_avg_island_size_mm"] = self.var_pzz_avg_island_size.get()
-            params["pzz_island_var"] = self.var_pzz_island_var.get()
-            params["pzz_num_islands"] = int(self.var_pzz_num_islands.get())
-            params["pzz_island_density"] = self.var_pzz_island_density.get()
-            params["pzz_clustering"] = self.var_pzz_clustering.get()
-            params["pzz_corridor_width_mm"] = self.var_pzz_corridor_width.get()
-            params["pzz_zigzag_amplitude_mm"] = self.var_pzz_zigzag_amplitude.get()
-            params["pzz_zigzag_frequency"] = self.var_pzz_zigzag_frequency.get()
-            params["pzz_num_corridors"] = int(self.var_pzz_num_corridors.get())
-            params["pzz_seed"] = int(self.var_pzz_seed.get())
-            params["pzz_show_centers"] = self.var_pzz_show_centers.get()
-        elif self.var_pattern_type.get() == "Compact":
-            params["irregularity"] = self.var_irregularity.get()
-            params["offset_x_mm"] = self.var_offset_x.get()
-            params["offset_y_mm"] = self.var_offset_y.get()
-            params["split_scar"] = self.var_split_scar.get()
-            params["split_distance_mm"] = self.var_split_distance.get() if self.var_split_scar.get() else 0.0
-            params["left_offset_x_mm"] = self.var_left_offset_x.get() if self.var_split_scar.get() else 0.0
-            params["left_offset_y_mm"] = self.var_left_offset_y.get() if self.var_split_scar.get() else 0.0
-            params["split_rotation_left"] = self.var_split_rotation_left.get() if self.var_split_scar.get() else 0.0
-            params["right_offset_x_mm"] = self.var_right_offset_x.get() if self.var_split_scar.get() else 0.0
-            params["right_offset_y_mm"] = self.var_right_offset_y.get() if self.var_split_scar.get() else 0.0
-            params["split_rotation_right"] = self.var_split_rotation_right.get() if self.var_split_scar.get() else 0.0
-            
+
+        # Secondary fibrosis in the remaining area (optional, independent coverage/type)
+        params["secondary_enabled"] = self.var_secondary_enabled.get()
+        params["secondary_coverage"] = self.var_secondary_coverage.get() / 100.0
+        sec_type = self.var_secondary_pattern_type.get()
+        params["secondary_pattern_type"] = None if sec_type == "Same as main" else sec_type
+
+        # Include parameters for all pattern types so the main and any secondary
+        # pattern type both have the values they need.
+        params["spacing_along_mm"] = self.var_spacing_along.get() / 1000.0
+        params["spacing_across_mm"] = self.var_spacing_across.get() / 1000.0
+        params["indentation"] = self.var_indentation.get()
+        params["randomness"] = self.var_randomness.get() / 100.0
+        params["num_islands"] = int(self.var_num_islands.get())
+        params["density"] = self.var_density.get()
+        params["pzz_avg_island_size_mm"] = self.var_pzz_avg_island_size.get()
+        params["pzz_island_var"] = self.var_pzz_island_var.get()
+        params["pzz_num_islands"] = int(self.var_pzz_num_islands.get())
+        params["pzz_island_density"] = self.var_pzz_island_density.get()
+        params["pzz_clustering"] = self.var_pzz_clustering.get()
+        params["pzz_corridor_width_mm"] = self.var_pzz_corridor_width.get()
+        params["pzz_zigzag_amplitude_mm"] = self.var_pzz_zigzag_amplitude.get()
+        params["pzz_zigzag_frequency"] = self.var_pzz_zigzag_frequency.get()
+        params["pzz_num_corridors"] = int(self.var_pzz_num_corridors.get())
+        params["pzz_seed"] = int(self.var_pzz_seed.get())
+        params["pzz_show_centers"] = self.var_pzz_show_centers.get()
+        params["irregularity"] = self.var_irregularity.get()
+        params["offset_x_mm"] = self.var_offset_x.get()
+        params["offset_y_mm"] = self.var_offset_y.get()
+        params["split_scar"] = self.var_split_scar.get()
+        params["split_distance_mm"] = self.var_split_distance.get() if self.var_split_scar.get() else 0.0
+        params["left_offset_x_mm"] = self.var_left_offset_x.get() if self.var_split_scar.get() else 0.0
+        params["left_offset_y_mm"] = self.var_left_offset_y.get() if self.var_split_scar.get() else 0.0
+        params["split_rotation_left"] = self.var_split_rotation_left.get() if self.var_split_scar.get() else 0.0
+        params["right_offset_x_mm"] = self.var_right_offset_x.get() if self.var_split_scar.get() else 0.0
+        params["right_offset_y_mm"] = self.var_right_offset_y.get() if self.var_split_scar.get() else 0.0
+        params["split_rotation_right"] = self.var_split_rotation_right.get() if self.var_split_scar.get() else 0.0
+
         return params
     
     def on_generate(self):
@@ -2161,38 +2383,12 @@ class PatternCreatorApp:
         self.compact_offset_mode = False
 
 # ========== RENDER AND GENERATE FUNCTIONS ==========
-def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15,
-                         complete_to_10mm=False, seed=None, **kwargs):
-    """Render preview image"""
-    if seed is not None:
-        random.seed(seed)
-    
-    pattern_diameter_mm = circle_diameter_mm
-    display_diameter_mm = 10.0 if (complete_to_10mm and pattern_diameter_mm < 10.0) else pattern_diameter_mm
-    display_scale = display_diameter_mm / pattern_diameter_mm if pattern_diameter_mm > 0 else 1.0
-    output_size_px = int(round(size_px * max(1.0, display_scale)))
+def _draw_pattern_layer_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
+                                pattern_type, circle_diameter_mm, kwargs):
+    """Draw a single fibrosis pattern (black on white) into a preview tissue image.
 
-    base = Image.new("L", (output_size_px, output_size_px), 0)
-    draw_base = ImageDraw.Draw(base)
-    cx = cy = output_size_px / 2.0
-    pattern_outer_radius_px = size_px * 0.45
-    display_radius_px = pattern_outer_radius_px * (display_diameter_mm / pattern_diameter_mm)
-    
-    # Draw outer white circle
-    draw_base.ellipse((cx - display_radius_px, cy - display_radius_px,
-                      cx + display_radius_px, cy + display_radius_px), fill=255)
-    
-    # Calculate pattern region (with white border)
-    pattern_radius_px = pattern_outer_radius_px * (1.0 - max(0.0, min(0.9, white_border_fraction)))
-    
-    # Calculate inner coverage needed
-    area_ratio = (pattern_radius_px / pattern_outer_radius_px) ** 2
-    inner_coverage = coverage / area_ratio if area_ratio > 0 else 0
-    inner_coverage = min(0.99, inner_coverage)
-    
-    tissue = Image.new("L", (output_size_px, output_size_px), 255)
-    draw_t = ImageDraw.Draw(tissue)
-    
+    This is the shared per-region generator; callers mask the result to a region.
+    """
     if pattern_type == "Interstitial":
         rect_length_mm = kwargs.get("rect_length_mm", 0.5)
         rect_width_mm = kwargs.get("rect_width_mm", 0.2)
@@ -2200,25 +2396,23 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
         spacing_across_mm = kwargs.get("spacing_across_mm", 0.2)
         angle_deg = kwargs.get("angle_deg", 0)
         indentation = kwargs.get("indentation", 0.0)
-        
+
         rect_length_px = (rect_length_mm / circle_diameter_mm) * (2 * pattern_radius_px)
         rect_width_px = (rect_width_mm / circle_diameter_mm) * (2 * pattern_radius_px)
         spacing_along_px = (spacing_along_mm / circle_diameter_mm) * (2 * pattern_radius_px)
         spacing_across_px = (spacing_across_mm / circle_diameter_mm) * (2 * pattern_radius_px)
-        
+
         add_interstitial_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
                                 rect_length_px, rect_width_px, spacing_along_px, spacing_across_px, angle_deg, indentation)
-    
+
     elif pattern_type == "Diffuse":
         rect_length_mm = kwargs.get("rect_length_mm", 0.5)
         rect_width_mm = kwargs.get("rect_width_mm", 0.2)
         randomness = kwargs.get("randomness", 0.5)
-        angle_deg = kwargs.get("angle_deg", 0)
-        
+
         rect_length_px = (rect_length_mm / circle_diameter_mm) * (2 * pattern_radius_px)
         rect_width_px = (rect_width_mm / circle_diameter_mm) * (2 * pattern_radius_px)
 
-        # Create diffuse preview from coverage-matched layout
         layout = generate_diffuse_layout(
             pattern_radius_px,
             inner_coverage,
@@ -2250,16 +2444,15 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
                 points.append((px + rx, py + ry))
 
             draw_t.polygon(points, fill=0, outline=0)
-    
+
     elif pattern_type == "Patchy":
         num_islands = kwargs.get("num_islands", 8)
         density = kwargs.get("density", 1.0)
-        
+
         add_patchy_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
                           None, num_islands, density)
 
     elif pattern_type == "Patchy Zig-Zag":
-        # collect parameters
         pzz_avg_island_size_mm = kwargs.get("pzz_avg_island_size_mm", 0.5)
         pzz_island_var = kwargs.get("pzz_island_var", 0.4)
         pzz_num_islands = kwargs.get("pzz_num_islands", 30)
@@ -2278,7 +2471,7 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
                                   pzz_island_density, pzz_clustering, pzz_corridor_width_mm,
                                   pzz_zigzag_amplitude_mm, pzz_zigzag_frequency, pzz_num_corridors, pzz_seed,
                                   show_centers=pzz_show_centers)
-    
+
     elif pattern_type == "Compact":
         irregularity = kwargs.get("irregularity", 0.5)
         offset_x_mm = kwargs.get("offset_x_mm", 0.0)
@@ -2291,26 +2484,172 @@ def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, wh
         right_offset_y_mm = kwargs.get("right_offset_y_mm", 0.0)
         split_rotation_left = kwargs.get("split_rotation_left", 0.0)
         split_rotation_right = kwargs.get("split_rotation_right", 0.0)
-        
+
         offset_x_px = (offset_x_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
         offset_y_px = (offset_y_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
         left_offset_x_px = (left_offset_x_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
         left_offset_y_px = (left_offset_y_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
         right_offset_x_px = (right_offset_x_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
         right_offset_y_px = (right_offset_y_mm / circle_diameter_mm) * (2 * pattern_radius_px) if circle_diameter_mm > 0 else 0
-        
+
         add_compact_preview(draw_t, cx, cy, pattern_radius_px, inner_coverage,
-                           irregularity, offset_x_px, offset_y_px, split_scar, split_distance_mm, 
+                           irregularity, offset_x_px, offset_y_px, split_scar, split_distance_mm,
                            left_offset_x_px, left_offset_y_px, split_rotation_left,
                            right_offset_x_px, right_offset_y_px, split_rotation_right)
+
+
+def _draw_pattern_layer_pdf(c, cx, cy, pattern_radius_pt, inner_coverage,
+                            pattern_type, circle_diameter_mm, kwargs):
+    """Draw a single fibrosis pattern into the PDF canvas within the current clip."""
+    c.setFillColor(colors.black)
+
+    if pattern_type == "Interstitial":
+        rect_length_mm = kwargs.get("rect_length_mm", 0.5)
+        rect_width_mm = kwargs.get("rect_width_mm", 0.2)
+        spacing_along_mm = kwargs.get("spacing_along_mm", 0.2)
+        spacing_across_mm = kwargs.get("spacing_across_mm", 0.2)
+        angle_deg = kwargs.get("angle_deg", 0)
+        indentation = kwargs.get("indentation", 0.0)
+
+        add_interstitial(c, cx, cy, pattern_radius_pt, inner_coverage,
+                        rect_length_mm, rect_width_mm, spacing_along_mm, spacing_across_mm,
+                        angle_deg, indentation)
+
+    elif pattern_type == "Diffuse":
+        rect_length_mm = kwargs.get("rect_length_mm", 0.5)
+        rect_width_mm = kwargs.get("rect_width_mm", 0.2)
+        randomness = kwargs.get("randomness", 0.5)
+
+        rect_length_pt = rect_length_mm * mm
+        rect_width_pt = rect_width_mm * mm
+
+        layout = generate_diffuse_layout(
+            pattern_radius_pt,
+            inner_coverage,
+            rect_length_pt,
+            rect_width_pt,
+            randomness,
+        )
+
+        for lx, ly, rect_angle in layout:
+            px = cx + lx
+            py = cy + ly
+
+            c.saveState()
+            c.translate(px, py)
+            c.rotate(rect_angle)
+            c.rect(-rect_length_pt / 2.0, -rect_width_pt / 2.0,
+                   rect_length_pt, rect_width_pt, stroke=0, fill=1)
+            c.restoreState()
+
+    elif pattern_type == "Patchy":
+        num_islands = kwargs.get("num_islands", 8)
+        density = kwargs.get("density", 1.0)
+
+        add_patchy(c, cx, cy, pattern_radius_pt, inner_coverage,
+                  None, num_islands, density)
+
+    elif pattern_type == "Patchy Zig-Zag":
+        pzz_avg_island_size_mm = kwargs.get("pzz_avg_island_size_mm", 0.5)
+        pzz_island_var = kwargs.get("pzz_island_var", 0.4)
+        pzz_num_islands = kwargs.get("pzz_num_islands", 30)
+        pzz_island_density = kwargs.get("pzz_island_density", 1.0)
+        pzz_clustering = kwargs.get("pzz_clustering", 0.8)
+        pzz_corridor_width_mm = kwargs.get("pzz_corridor_width_mm", 0.6)
+        pzz_zigzag_amplitude_mm = kwargs.get("pzz_zigzag_amplitude_mm", 1.5)
+        pzz_zigzag_frequency = kwargs.get("pzz_zigzag_frequency", 4.0)
+        pzz_num_corridors = kwargs.get("pzz_num_corridors", 3)
+        pzz_seed = kwargs.get("pzz_seed", 0) or None
+
+        add_patchy_zigzag(c, cx, cy, pattern_radius_pt, inner_coverage,
+                         circle_diameter_mm,
+                         pzz_avg_island_size_mm, pzz_island_var, pzz_num_islands,
+                         pzz_island_density, pzz_clustering, pzz_corridor_width_mm,
+                         pzz_zigzag_amplitude_mm, pzz_zigzag_frequency, pzz_num_corridors, pzz_seed)
+
+    elif pattern_type == "Compact":
+        irregularity = kwargs.get("irregularity", 0.5)
+        offset_x_mm = kwargs.get("offset_x_mm", 0.0)
+        offset_y_mm = kwargs.get("offset_y_mm", 0.0)
+        split_scar = kwargs.get("split_scar", False)
+        split_distance_mm = kwargs.get("split_distance_mm", 0.0)
+        left_offset_x_mm = kwargs.get("left_offset_x_mm", 0.0)
+        left_offset_y_mm = kwargs.get("left_offset_y_mm", 0.0)
+        right_offset_x_mm = kwargs.get("right_offset_x_mm", 0.0)
+        right_offset_y_mm = kwargs.get("right_offset_y_mm", 0.0)
+        split_rotation_left = kwargs.get("split_rotation_left", 0.0)
+        split_rotation_right = kwargs.get("split_rotation_right", 0.0)
+
+        add_compact(c, cx, cy, pattern_radius_pt, inner_coverage,
+                   irregularity, offset_x_mm, offset_y_mm, split_scar, split_distance_mm,
+                   left_offset_x_mm, left_offset_y_mm, split_rotation_left,
+                   right_offset_x_mm, right_offset_y_mm, split_rotation_right)
+
+
+def render_pattern_image(size_px, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15,
+                         complete_to_10mm=False, seed=None, **kwargs):
+    """Render preview image"""
+    if seed is not None:
+        random.seed(seed)
     
-    # Mask to pattern region
-    mask = Image.new("L", (output_size_px, output_size_px), 0)
-    draw_m = ImageDraw.Draw(mask)
-    draw_m.ellipse((cx - pattern_radius_px, cy - pattern_radius_px, 
-                   cx + pattern_radius_px, cy + pattern_radius_px), fill=255)
-    base.paste(tissue, (0, 0), mask)
+    pattern_diameter_mm = circle_diameter_mm
+    display_diameter_mm = 10.0 if (complete_to_10mm and pattern_diameter_mm < 10.0) else pattern_diameter_mm
+    display_scale = display_diameter_mm / pattern_diameter_mm if pattern_diameter_mm > 0 else 1.0
+    output_size_px = int(round(size_px * max(1.0, display_scale)))
+
+    base = Image.new("L", (output_size_px, output_size_px), 0)
+    draw_base = ImageDraw.Draw(base)
+    cx = cy = output_size_px / 2.0
+    pattern_outer_radius_px = size_px * 0.45
+    display_radius_px = pattern_outer_radius_px * (display_diameter_mm / pattern_diameter_mm)
     
+    # Draw outer white circle
+    draw_base.ellipse((cx - display_radius_px, cy - display_radius_px,
+                      cx + display_radius_px, cy + display_radius_px), fill=255)
+    
+    # Calculate pattern region (with white border)
+    pattern_radius_px = pattern_outer_radius_px * (1.0 - max(0.0, min(0.9, white_border_fraction)))
+    
+    # Calculate inner coverage needed. Coverage refers to the fibrosis percentage
+    # within the selected placement region, so divide by the region's allowed-area fraction.
+    placement = kwargs.get("placement", "Full circle")
+    cov_factor = _placement_coverage_factor(placement, white_border_fraction)
+    inner_coverage = coverage / cov_factor if cov_factor > 0 else 0
+    inner_coverage = min(0.99, inner_coverage)
+    
+    tissue = Image.new("L", (output_size_px, output_size_px), 255)
+
+    # Base circular mask = the allowed pattern area (inside the white border).
+    circle_mask = Image.new("L", (output_size_px, output_size_px), 0)
+    ImageDraw.Draw(circle_mask).ellipse(
+        (cx - pattern_radius_px, cy - pattern_radius_px,
+         cx + pattern_radius_px, cy + pattern_radius_px), fill=255)
+
+    # Optional secondary fibrosis in the remaining area (independent region/coverage).
+    secondary_enabled = kwargs.get("secondary_enabled", False)
+    remaining_factor = _remaining_coverage_factor(placement, white_border_fraction)
+    if secondary_enabled and remaining_factor:
+        sec_coverage = kwargs.get("secondary_coverage", 0.0)
+        sec_type = kwargs.get("secondary_pattern_type") or pattern_type
+        sec_inner = min(0.99, sec_coverage / remaining_factor) if remaining_factor > 0 else 0
+        if seed is not None:
+            random.seed(seed + 1)
+        tissue_sec = Image.new("L", (output_size_px, output_size_px), 255)
+        _draw_pattern_layer_preview(ImageDraw.Draw(tissue_sec), cx, cy, pattern_radius_px,
+                                    sec_inner, sec_type, circle_diameter_mm, kwargs)
+        mask_sec = _region_mask_preview(circle_mask.copy(), cx, cy, pattern_outer_radius_px,
+                                        placement, remaining=True)
+        base.paste(tissue_sec, (0, 0), mask_sec)
+
+    # Main fibrosis in the selected placement region.
+    if seed is not None:
+        random.seed(seed)
+    _draw_pattern_layer_preview(ImageDraw.Draw(tissue), cx, cy, pattern_radius_px,
+                                inner_coverage, pattern_type, circle_diameter_mm, kwargs)
+    mask_main = _region_mask_preview(circle_mask.copy(), cx, cy, pattern_outer_radius_px,
+                                     placement, remaining=False)
+    base.paste(tissue, (0, 0), mask_main)
+
     return base.convert("RGB")
 
 def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white_border_fraction=0.15,
@@ -2346,105 +2685,44 @@ def generate_pattern(filename, pattern_type, coverage, circle_diameter_mm, white
     # Calculate pattern region
     pattern_radius_pt = pattern_outer_radius_pt * (1.0 - max(0.0, min(0.9, white_border_fraction)))
     
-    # Calculate inner coverage
-    area_ratio = (pattern_radius_pt / pattern_outer_radius_pt) ** 2
-    inner_coverage = coverage / area_ratio if area_ratio > 0 else 0
+    # Calculate inner coverage. Coverage refers to fibrosis within the placement region.
+    placement = kwargs.get("placement", "Full circle")
+    cov_factor = _placement_coverage_factor(placement, white_border_fraction)
+    inner_coverage = coverage / cov_factor if cov_factor > 0 else 0
     inner_coverage = min(0.99, inner_coverage)
     
-    # Clip to pattern region
+    # Clip to the allowed pattern area (inside the white border).
     c.saveState()
     p = c.beginPath()
     p.circle(cx, cy, pattern_radius_pt)
     c.clipPath(p, stroke=0, fill=0)
-    
-    # Draw pattern
-    if pattern_type == "Interstitial":
-        rect_length_mm = kwargs.get("rect_length_mm", 0.5)
-        rect_width_mm = kwargs.get("rect_width_mm", 0.2)
-        spacing_along_mm = kwargs.get("spacing_along_mm", 0.2)
-        spacing_across_mm = kwargs.get("spacing_across_mm", 0.2)
-        angle_deg = kwargs.get("angle_deg", 0)
-        indentation = kwargs.get("indentation", 0.0)
-        
-        add_interstitial(c, cx, cy, pattern_radius_pt, inner_coverage,
-                        rect_length_mm, rect_width_mm, spacing_along_mm, spacing_across_mm, 
-                        angle_deg, indentation)
-    
-    elif pattern_type == "Diffuse":
-        rect_length_mm = kwargs.get("rect_length_mm", 0.5)
-        rect_width_mm = kwargs.get("rect_width_mm", 0.2)
-        randomness = kwargs.get("randomness", 0.5)
-        angle_deg = kwargs.get("angle_deg", 0)
-        
-        rect_length_pt = rect_length_mm * mm
-        rect_width_pt = rect_width_mm * mm
-        
-        c.setFillColor(colors.black)
-        
-        # Draw coverage-matched diffuse layout
-        layout = generate_diffuse_layout(
-            pattern_radius_pt,
-            inner_coverage,
-            rect_length_pt,
-            rect_width_pt,
-            randomness,
-        )
 
-        for lx, ly, rect_angle in layout:
-            px = cx + lx
-            py = cy + ly
+    # Optional secondary fibrosis in the remaining area. Draw it across the whole
+    # allowed area, then paint the placement region white so it survives only outside.
+    secondary_enabled = kwargs.get("secondary_enabled", False)
+    remaining_factor = _remaining_coverage_factor(placement, white_border_fraction)
+    if secondary_enabled and remaining_factor:
+        sec_coverage = kwargs.get("secondary_coverage", 0.0)
+        sec_type = kwargs.get("secondary_pattern_type") or pattern_type
+        sec_inner = min(0.99, sec_coverage / remaining_factor) if remaining_factor > 0 else 0
+        if seed is not None:
+            random.seed(seed + 1)
+        c.saveState()
+        _draw_pattern_layer_pdf(c, cx, cy, pattern_radius_pt, sec_inner,
+                                sec_type, circle_diameter_mm, kwargs)
+        c.restoreState()
+        c.setFillColor(colors.white)
+        _fill_placement_shape_pdf(c, cx, cy, pattern_outer_radius_pt, placement, dummy_size)
 
-            c.saveState()
-            c.translate(px, py)
-            c.rotate(rect_angle)
-            c.rect(-rect_length_pt / 2.0, -rect_width_pt / 2.0,
-                   rect_length_pt, rect_width_pt, stroke=0, fill=1)
-            c.restoreState()
-    
-    elif pattern_type == "Patchy":
-        num_islands = kwargs.get("num_islands", 8)
-        density = kwargs.get("density", 1.0)
-        
-        add_patchy(c, cx, cy, pattern_radius_pt, inner_coverage,
-                  None, num_islands, density)
-
-    elif pattern_type == "Patchy Zig-Zag":
-        pzz_avg_island_size_mm = kwargs.get("pzz_avg_island_size_mm", 0.5)
-        pzz_island_var = kwargs.get("pzz_island_var", 0.4)
-        pzz_num_islands = kwargs.get("pzz_num_islands", 30)
-        pzz_island_density = kwargs.get("pzz_island_density", 1.0)
-        pzz_clustering = kwargs.get("pzz_clustering", 0.8)
-        pzz_corridor_width_mm = kwargs.get("pzz_corridor_width_mm", 0.6)
-        pzz_zigzag_amplitude_mm = kwargs.get("pzz_zigzag_amplitude_mm", 1.5)
-        pzz_zigzag_frequency = kwargs.get("pzz_zigzag_frequency", 4.0)
-        pzz_num_corridors = kwargs.get("pzz_num_corridors", 3)
-        pzz_seed = kwargs.get("pzz_seed", 0) or None
-
-        add_patchy_zigzag(c, cx, cy, pattern_radius_pt, inner_coverage,
-                         circle_diameter_mm,
-                         pzz_avg_island_size_mm, pzz_island_var, pzz_num_islands,
-                         pzz_island_density, pzz_clustering, pzz_corridor_width_mm,
-                         pzz_zigzag_amplitude_mm, pzz_zigzag_frequency, pzz_num_corridors, pzz_seed)
-    
-    elif pattern_type == "Compact":
-        irregularity = kwargs.get("irregularity", 0.5)
-        offset_x_mm = kwargs.get("offset_x_mm", 0.0)
-        offset_y_mm = kwargs.get("offset_y_mm", 0.0)
-        split_scar = kwargs.get("split_scar", False)
-        split_distance_mm = kwargs.get("split_distance_mm", 0.0)
-        left_offset_x_mm = kwargs.get("left_offset_x_mm", 0.0)
-        left_offset_y_mm = kwargs.get("left_offset_y_mm", 0.0)
-        right_offset_x_mm = kwargs.get("right_offset_x_mm", 0.0)
-        right_offset_y_mm = kwargs.get("right_offset_y_mm", 0.0)
-        split_rotation_left = kwargs.get("split_rotation_left", 0.0)
-        split_rotation_right = kwargs.get("split_rotation_right", 0.0)
-        
-        add_compact(c, cx, cy, pattern_radius_pt, inner_coverage,
-                   irregularity, offset_x_mm, offset_y_mm, split_scar, split_distance_mm,
-                   left_offset_x_mm, left_offset_y_mm, split_rotation_left,
-                   right_offset_x_mm, right_offset_y_mm, split_rotation_right)
-    
+    # Main fibrosis in the selected placement region.
+    if seed is not None:
+        random.seed(seed)
+    c.saveState()
+    _apply_placement_clip_pdf(c, cx, cy, pattern_outer_radius_pt, placement, dummy_size)
+    _draw_pattern_layer_pdf(c, cx, cy, pattern_radius_pt, inner_coverage,
+                            pattern_type, circle_diameter_mm, kwargs)
     c.restoreState()
+
     c.restoreState()
     c.showPage()
     c.save()
